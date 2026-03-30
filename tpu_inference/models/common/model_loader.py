@@ -62,7 +62,10 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     # NOTE: Use inline imports here, otherwise the normal imports
     # would cause JAX init failure when using multi hosts with Ray.
 
+    from tpu_inference.models.jax.chatglm import ChatGLMForCausalLM
     from tpu_inference.models.jax.deepseek_v3 import DeepseekV3ForCausalLM
+    from tpu_inference.models.jax.glm4_moe import Glm4MoeForCausalLM
+    from tpu_inference.models.jax.glm5 import Glm5ForCausalLM
     from tpu_inference.models.jax.gpt_oss import GptOss
     from tpu_inference.models.jax.llama3 import LlamaForCausalLM
     from tpu_inference.models.jax.llama4 import Llama4ForCausalLM
@@ -73,6 +76,11 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
         Qwen2_5_VLForConditionalGeneration
     from tpu_inference.models.jax.qwen3 import Qwen3ForCausalLM
     from tpu_inference.models.jax.qwen3_moe import Qwen3MoeForCausalLM
+    from tpu_inference.models.jax.qwen3_vl import \
+        Qwen3VLForConditionalGeneration
+    _MODEL_REGISTRY["ChatGLMModel"] = ChatGLMForCausalLM
+    _MODEL_REGISTRY["Glm4MoeForCausalLM"] = Glm4MoeForCausalLM
+    _MODEL_REGISTRY["GlmMoeDsaForCausalLM"] = Glm5ForCausalLM
     _MODEL_REGISTRY["Llama4ForCausalLM"] = Llama4ForCausalLM
     _MODEL_REGISTRY["DeepseekV3ForCausalLM"] = DeepseekV3ForCausalLM
     _MODEL_REGISTRY["LlamaForCausalLM"] = LlamaForCausalLM
@@ -81,6 +89,8 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     _MODEL_REGISTRY["Qwen3MoeForCausalLM"] = Qwen3MoeForCausalLM
     _MODEL_REGISTRY[
         "Qwen2_5_VLForConditionalGeneration"] = Qwen2_5_VLForConditionalGeneration
+    _MODEL_REGISTRY[
+        "Qwen3VLForConditionalGeneration"] = Qwen3VLForConditionalGeneration
     _MODEL_REGISTRY["Eagle3LlamaForCausalLM"] = EagleLlama3ForCausalLM
     _MODEL_REGISTRY["GptOssForCausalLM"] = GptOss
     _MODEL_REGISTRY["Qwen2ForCausalLM"] = Qwen2ForCausalLM
