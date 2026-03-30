@@ -1084,6 +1084,9 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
                 "model.embed_tokens.weight",
             "model.language_model.norm.weight":
                 "model.norm.weight",
+            # lm_head is not tied in 8B (separate weight); the loader strips
+            # ".weight" → "lm_head" before the map lookup, so map from "lm_head".
+            "lm_head": "lm_head.weight",
             # ----------------------------------------------------------------
             # LLM layer weights (matched by "layers.*" pattern)
             # ----------------------------------------------------------------
