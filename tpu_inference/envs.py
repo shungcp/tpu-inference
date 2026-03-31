@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     SC_KERNEL_THRESHOLD: int = 8192
     SC_KERNEL_COL_CHUNK_SIZE: int = 3072
     RPA_VMEM_LIMIT_BYTES: int | None = None
+    RPA_DECODE_BKV_SIZE: int | None = None
 
 
 def env_with_choices(
@@ -217,6 +218,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to e.g. 33554432 (32MB) on chips where spill overhead causes vmem OOM.
     "RPA_VMEM_LIMIT_BYTES":
     lambda: int(v) if (v := os.getenv("RPA_VMEM_LIMIT_BYTES")) is not None else None,
+    # Override the decode kernel bkv block size (must be divisible by page_size,
+    # typically 256). Reduces vmem usage on chips where bkv=4096 causes OOM.
+    # E.g. set to 1024 on v7x-8 when 4B model decode OOMs.
+    "RPA_DECODE_BKV_SIZE":
+    lambda: int(v) if (v := os.getenv("RPA_DECODE_BKV_SIZE")) is not None else None,
 }
 
 

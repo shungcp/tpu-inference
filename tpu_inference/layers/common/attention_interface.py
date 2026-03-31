@@ -385,6 +385,10 @@ def sharded_ragged_paged_attention(
         args += (attention_sink, )
 
     def _ragged_paged_attention(*args):
+        extra_kwargs = {}
+        if not use_hd64 and envs.RPA_DECODE_BKV_SIZE is not None:
+            bkv = envs.RPA_DECODE_BKV_SIZE
+            extra_kwargs["d_block_sizes"] = (1, bkv, 1, bkv)
         return func(
             *args,
             sm_scale=sm_scale,
@@ -393,6 +397,7 @@ def sharded_ragged_paged_attention(
             k_scale=k_scale,
             v_scale=v_scale,
             vmem_limit_bytes=envs.RPA_VMEM_LIMIT_BYTES,
+            **extra_kwargs,
         )
 
     return jax.shard_map(
