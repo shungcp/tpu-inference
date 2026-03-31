@@ -1866,34 +1866,19 @@ def ragged_paged_attention(
                 pages_per_seq,
                 case=case,
             )
-            # When vmem_limit_bytes is explicitly provided, also cap bkv_sz so
-            # that the kernel's DMA buffer footprint leaves room for VREG spill.
-            # get_vmem_estimate_bytes only counts DMA buffers (not spill), so
-            # we apply a conservative safety multiplier per case type:
-            #   - DECODE: 8x  (decode sees much higher spill pressure than prefill)
-            #   - PREFILL/MIXED: 3x
-            if vmem_limit_bytes is not None:
-                safety = 8 if case == RpaCase.DECODE else 3
-                bkv_sz = sizes["bkv_sz"]
-                bq_sz = 1 if case == RpaCase.DECODE else sizes["bq_sz"]
-                while bkv_sz > page_size:
-                    data_est = get_vmem_estimate_bytes(
-                        actual_num_kv_heads,
-                        actual_num_q_heads_per_kv_head,
-                        actual_head_dim,
-                        bq_sz,
-                        bkv_sz,
-                        q.dtype,
-                        kv_cache.dtype,
-                    )
-                    if data_est * safety <= vmem_limit_bytes:
-                        break
-                    bkv_sz = max(page_size, bkv_sz // 2)
-                sizes = {
-                    **sizes,
-                    "bkv_sz": bkv_sz,
-                    "bkv_csz": min(sizes["bkv_csz"], bkv_sz),
-                }
+            # Allow users to cap bkv_sz via env var to avoid vmem OOM on chips
+            # where the default (bandwidth-optimal) bkv exceeds available vmem.
+            # Note: bkv must be a multiple of page_size.
+            import os as _os
+            _max_bkv = _os.getenv("RPA_MAX_BKV_SIZE")
+            if _max_bkv is not None:
+                cap = max(page_size, int(_max_bkv))
+                if sizes["bkv_sz"] > cap:
+                    sizes = {
+                        **sizes,
+                        "bkv_sz": cap,
+                        "bkv_csz": min(sizes["bkv_csz"], cap),
+                    }
             return sizes
         return {
             "bq_sz": block_sizes[0],

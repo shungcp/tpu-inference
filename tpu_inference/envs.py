@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     SC_KERNEL_COL_CHUNK_SIZE: int = 3072
     RPA_VMEM_LIMIT_BYTES: int | None = None
     RPA_DECODE_BKV_SIZE: int | None = None
+    RPA_MAX_BKV_SIZE: int | None = None
 
 
 def env_with_choices(
@@ -223,6 +224,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # E.g. set to 1024 on v7x-8 when 4B model decode OOMs.
     "RPA_DECODE_BKV_SIZE":
     lambda: int(v) if (v := os.getenv("RPA_DECODE_BKV_SIZE")) is not None else None,
+    # Cap bkv_sz for ALL RPA kernel cases (decode/prefill/mixed) to avoid vmem
+    # OOM on chips where bandwidth-optimal bkv exceeds physical vmem.
+    # Must be a multiple of page_size (typically 256). Example: 1024 for v7x-8
+    # with 4B models where prefill bkv=2048 causes 67.71MB > 64MB vmem OOM.
+    "RPA_MAX_BKV_SIZE":
+    lambda: int(v) if (v := os.getenv("RPA_MAX_BKV_SIZE")) is not None else None,
 }
 
 
