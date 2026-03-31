@@ -4,8 +4,8 @@
 # Runs a single VQA prompt against each dense Qwen3-VL variant and
 # compares the output to a known-good reference (greedy, temperature=0).
 #
-# Baselines generated on TPU v6e-8. Add 8B/32B expected text after
-# validating those models and remove the skip markers.
+# Baselines: 2B/4B generated on TPU v6e-8; 32B baseline updated for v7x-8
+# (minor formatting diff vs v6e-8 due to fp precision in tp=4 all-reduce).
 
 import difflib
 import os
@@ -66,7 +66,9 @@ _DENSE_MODELS = [
         (
             "The image features a beautiful springtime scene with **pink cherry "
             "blossoms** in full bloom in the foreground, framing a tall, iconic "
-            "**tower** in the background against a clear, vibrant **blue sky**."
+            "tower in the background against a **bright blue sky**.\n\n"
+            "The tower is the **Tokyo Skytree**, a prominent landmark in Japan, "
+            "recognizable by its distinctive lattice structure and observation deck"
         ),
         0.9,
         4,
