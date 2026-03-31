@@ -32,7 +32,7 @@ _DENSE_MODELS = [
         ),
         0.5,
         1,
-        id="2B",
+        id="dense-2B",
     ),
     pytest.param(
         "Qwen/Qwen3-VL-4B-Instruct",
@@ -45,7 +45,7 @@ _DENSE_MODELS = [
         ),
         0.5,
         1,
-        id="4B",
+        id="dense-4B",
     ),
     pytest.param(
         "Qwen/Qwen3-VL-8B-Instruct",
@@ -59,7 +59,7 @@ _DENSE_MODELS = [
         ),
         0.6,
         1,
-        id="8B",
+        id="dense-8B",
     ),
     pytest.param(
         "Qwen/Qwen3-VL-32B-Instruct",
@@ -70,7 +70,7 @@ _DENSE_MODELS = [
         ),
         0.9,
         4,
-        id="32B",
+        id="dense-32B",
     ),
 ]
 

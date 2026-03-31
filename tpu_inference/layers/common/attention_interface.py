@@ -392,6 +392,7 @@ def sharded_ragged_paged_attention(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            vmem_limit_bytes=envs.RPA_VMEM_LIMIT_BYTES,
         )
 
     return jax.shard_map(

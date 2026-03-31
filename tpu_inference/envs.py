@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     USE_BATCHED_RPA_KERNEL: bool = False
     SC_KERNEL_THRESHOLD: int = 8192
     SC_KERNEL_COL_CHUNK_SIZE: int = 3072
+    RPA_VMEM_LIMIT_BYTES: int | None = None
 
 
 def env_with_choices(
@@ -210,6 +211,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("SC_KERNEL_THRESHOLD") or "8192"),
     "SC_KERNEL_COL_CHUNK_SIZE":
     lambda: int(os.getenv("SC_KERNEL_COL_CHUNK_SIZE") or "3072"),
+    # Override the vmem budget passed to the RPA kernel auto-tuner (bytes).
+    # The auto-tuner uses this to select bkv/bq block sizes.
+    # Default (None) lets the kernel read vmem capacity from hardware.
+    # Set to e.g. 33554432 (32MB) on chips where spill overhead causes vmem OOM.
+    "RPA_VMEM_LIMIT_BYTES":
+    lambda: int(v) if (v := os.getenv("RPA_VMEM_LIMIT_BYTES")) is not None else None,
 }
 
 
