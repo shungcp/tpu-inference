@@ -70,8 +70,20 @@ class Qwen3MoeSparseMoeBlock(JaxModule):
         quant_config = vllm_config.quant_config
 
         # --- Sharding Config ---
-        edf_sharding = (None, None, None)
-        expert_axis_name = edf_sharding[0]
+        # Use Expert Parallelism (EP): shard the E=128 expert dimension across
+        # all chips (ShardingAxisName.EXPERT = 'model' in 2D sharding).
+        # Each chip holds E/tp = 128/8 = 16 experts.
+        #
+        # Why not Tensor Parallelism (TP)?
+        # TP shards w1 along the N=2F output dimension.  Inside shard_map each
+        # chip sees size_n = 2F/tp = 2*768/8 = 192.  The GMM kernel requires
+        # size_n to be divisible by 2*num_lanes = 2*128 = 256, but 192%256 != 0
+        # → ValueError at runtime.  No TP value that fits in HBM satisfies this.
+        #
+        # EP shards along E instead, so each chip sees the full size_n = 2F =
+        # 1536 (1536 % 256 == 0 ✓).  Memory: 16 experts × F × D × 2 bytes ≈
+        # 50 MB per kernel per layer × 48 layers ≈ 7.2 GB total ✓.
+        expert_axis_name = ShardingAxisName.EXPERT
         num_expert_parallelism = get_expert_parallelism(expert_axis_name, mesh)
         use_ep = num_expert_parallelism > 1
         moe_backend = select_moe_backend(use_ep)
@@ -110,9 +122,10 @@ class Qwen3MoeSparseMoeBlock(JaxModule):
             router=self.gate,
             mesh=mesh,
             activation_ffw_td=P(ShardingAxisName.MLP_DATA, None),
-            activation_ffw_ted=P(ShardingAxisName.MLP_DATA, None, None),
-            edf_sharding=P(None, ),
-            efd_sharding=P(None, ),
+            activation_ffw_ted=P(ShardingAxisName.MLP_DATA, None,
+                                 ShardingAxisName.EXPERT),
+            edf_sharding=P(ShardingAxisName.EXPERT, None, None),
+            efd_sharding=P(ShardingAxisName.EXPERT, None, None),
             apply_expert_weight_before_computation=False,
             expert_axis_name=expert_axis_name,
             num_expert_parallelism=num_expert_parallelism,
