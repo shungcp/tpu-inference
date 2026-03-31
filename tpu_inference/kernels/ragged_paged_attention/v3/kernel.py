@@ -1854,7 +1854,7 @@ def ragged_paged_attention(
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
-            return get_default_block_sizes(
+            sizes = get_default_block_sizes(
                 q.dtype,
                 kv_cache.dtype,
                 actual_num_q_heads,
@@ -1866,6 +1866,35 @@ def ragged_paged_attention(
                 pages_per_seq,
                 case=case,
             )
+            # When vmem_limit_bytes is explicitly provided, also cap bkv_sz so
+            # that the kernel's DMA buffer footprint leaves room for VREG spill.
+            # get_vmem_estimate_bytes only counts DMA buffers (not spill), so
+            # we apply a conservative safety multiplier per case type:
+            #   - DECODE: 8x  (decode sees much higher spill pressure than prefill)
+            #   - PREFILL/MIXED: 3x
+            if vmem_limit_bytes is not None:
+                safety = 8 if case == RpaCase.DECODE else 3
+                bkv_sz = sizes["bkv_sz"]
+                bq_sz = 1 if case == RpaCase.DECODE else sizes["bq_sz"]
+                while bkv_sz > page_size:
+                    data_est = get_vmem_estimate_bytes(
+                        actual_num_kv_heads,
+                        actual_num_q_heads_per_kv_head,
+                        actual_head_dim,
+                        bq_sz,
+                        bkv_sz,
+                        q.dtype,
+                        kv_cache.dtype,
+                    )
+                    if data_est * safety <= vmem_limit_bytes:
+                        break
+                    bkv_sz = max(page_size, bkv_sz // 2)
+                sizes = {
+                    **sizes,
+                    "bkv_sz": bkv_sz,
+                    "bkv_csz": min(sizes["bkv_csz"], bkv_sz),
+                }
+            return sizes
         return {
             "bq_sz": block_sizes[0],
             "bkv_sz": block_sizes[1],
