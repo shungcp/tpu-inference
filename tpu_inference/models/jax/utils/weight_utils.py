@@ -52,6 +52,13 @@ logger = init_logger(__name__)
 
 HF_WEIGHTS_FORMAT = "*.safetensors"
 
+import ml_dtypes as _ml_dtypes
+import numpy as _np
+if not hasattr(_np, 'float8_e4m3fn'):
+    _np.float8_e4m3fn = _ml_dtypes.float8_e4m3fn
+    _np.float8_e5m2 = _ml_dtypes.float8_e5m2
+
+
 DTYPE_VIEW_MAP = {
     jnp.dtype(jnp.float8_e4m3fn): torch.uint8,
     jnp.dtype(jnp.bfloat16): torch.uint16,

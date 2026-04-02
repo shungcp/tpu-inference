@@ -229,6 +229,12 @@ class Fp8BlockwiseLinearMethod(QuantizeMethodBase, common_fp8.Fp8LinearMethod):
                                   param_name=layer.prefix + ".weight"),
             eager_sharding=False)
         layer.weight.set_metadata('sharding', self.weight_sharding)
+        # Clear out_sharding inherited from the BF16 kernel_init wrapper.
+        # nnx.with_partitioning stores `out_sharding=(None,'model',None)` for
+        # BF16 3D attention weights; get_var_pspec reads out_sharding to build
+        # the NamedSharding for nnx.get_named_sharding.  The FP8 replacement
+        # is 2D, so applying the rank-3 spec causes a ValueError at device_put.
+        layer.weight.set_metadata('out_sharding', None)
 
         # Block-wise quantization scale
         block_n, block_k = self.quant_config.weight_block_size[
@@ -247,6 +253,7 @@ class Fp8BlockwiseLinearMethod(QuantizeMethodBase, common_fp8.Fp8LinearMethod):
             ),
             eager_sharding=False)
         layer.weight_scale_inv.set_metadata('sharding', self.weight_sharding)
+        layer.weight_scale_inv.set_metadata('out_sharding', None)
 
         # Force the parameters to be loaded onto CPU, such that in `process_weights_after_loading`
         # we can process the weights on CPU to avoid OOM on device.

@@ -31,6 +31,7 @@ Key differences from Qwen3VLForConditionalGeneration (dense):
 """
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Tuple
 
 import jax
@@ -42,6 +43,7 @@ from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
     Qwen3VLMoeConfig)
 from vllm.config import VllmConfig
 
+from tpu_inference import utils as tpu_utils
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.jax.linear import JaxEinsum
@@ -155,6 +157,29 @@ class Qwen3VLMoeForConditionalGeneration(nnx.Module):
 
     def __init__(self, vllm_config: VllmConfig, rng_key: jax.Array,
                  mesh: Mesh) -> None:
+        if getattr(vllm_config.model_config, "quantization", None) == "fp8":
+            # `get_tpu_quantization_config` returns None for "fp8" because
+            # the work in #1623 is not fully merged. So this block overrides
+            # the logic to return Fp8Config when model_config indicates fp8.
+            # TODO(#1623): Remove this block when `get_tpu_quantization_config`
+            # is updated.
+            from tpu_inference.layers.jax.quantization.fp8 import Fp8Config
+            hg_quant_config = getattr(vllm_config.model_config.hf_config,
+                                      "quantization_config", {})
+            vllm_config.quant_config = Fp8Config(hg_quant_config)
+            # HF ignored_layers use "model.language_model.layers.N.*" naming,
+            # but JAX layer prefixes use "model.layers.N.*" (no "language_model.").
+            # Translate so that is_layer_skipped matches correctly (e.g. gate router).
+            _existing = set(vllm_config.quant_config.ignored_layers)
+            _extra = [
+                _l.replace("model.language_model.", "model.")
+                for _l in _existing
+                if "model.language_model." in _l
+            ]
+            vllm_config.quant_config.ignored_layers = list(_existing) + [
+                _l for _l in _extra if _l not in _existing
+            ]
+
         hf_config: Qwen3VLMoeConfig = vllm_config.model_config.hf_config
         text_config = hf_config.text_config
 
@@ -571,16 +596,24 @@ class Qwen3VLMoeForConditionalGeneration(nnx.Module):
                 "model.layers.*.post_attention_layernorm.weight",
             "model.language_model.layers.*.self_attn.q_proj.weight":
                 "model.layers.*.self_attn.q_proj.weight",
+            "model.language_model.layers.*.self_attn.q_proj.weight_scale_inv":
+                "model.layers.*.self_attn.q_proj.weight_scale_inv",
             "model.language_model.layers.*.self_attn.q_norm.weight":
                 "model.layers.*.self_attn.q_norm.weight",
             "model.language_model.layers.*.self_attn.k_proj.weight":
                 "model.layers.*.self_attn.k_proj.weight",
+            "model.language_model.layers.*.self_attn.k_proj.weight_scale_inv":
+                "model.layers.*.self_attn.k_proj.weight_scale_inv",
             "model.language_model.layers.*.self_attn.k_norm.weight":
                 "model.layers.*.self_attn.k_norm.weight",
             "model.language_model.layers.*.self_attn.v_proj.weight":
                 "model.layers.*.self_attn.v_proj.weight",
+            "model.language_model.layers.*.self_attn.v_proj.weight_scale_inv":
+                "model.layers.*.self_attn.v_proj.weight_scale_inv",
             "model.language_model.layers.*.self_attn.o_proj.weight":
                 "model.layers.*.self_attn.o_proj.weight",
+            "model.language_model.layers.*.self_attn.o_proj.weight_scale_inv":
+                "model.layers.*.self_attn.o_proj.weight_scale_inv",
             # NOTE: mlp.gate.weight is handled by _load_gate_weight (custom),
             # not here, because the NNX state path for the shared JaxLinear
             # router object is not predictable across NNX versions.
@@ -612,6 +645,57 @@ class Qwen3VLMoeForConditionalGeneration(nnx.Module):
 
         keep_suffix = ["model.language_model"]
 
+        # For FP8 models, keep all weights in their original dtype (FP8 weights
+        # and float32 scale tensors) instead of converting to model_config.dtype.
+        # Detect FP8 by quant_config type or quantization field.
+        # TODO(#1623): Remove when get_tpu_quantization_config handles FP8.
+        from tpu_inference.layers.jax.quantization.fp8 import Fp8Config
+        is_fp8 = (isinstance(self.vllm_config.quant_config, Fp8Config)
+                  or getattr(self.vllm_config.model_config, "quantization",
+                              None) == "fp8")
+        keep_original_dtype_keys_regex = [".*"] if is_fp8 else None
+
+        # FP8 attention-projection padding config.
+        # Under Fp8Config, JaxEinsum initialises q/k/v/o_proj kernels as 2D
+        # tensors in the shape (out_features_flat, in_features_flat) where the
+        # head dimension has already been padded for the sharding mesh.
+        # The HF FP8 checkpoint however stores the un-padded weights.
+        # We pre-pad here so the weight arrives at _load_and_shard_weight
+        # already at the expected 2D shape with no further reshape/transpose
+        # needed (those transforms are designed for BF16 3D layouts).
+        _fp8_attn_pad_cfg = {}  # proj_substr → (num_heads_orig, head_dim)
+        if is_fp8:
+            _sharding_size = self.mesh.shape["model"]
+            _head_dim_orig = getattr(
+                text_config, "head_dim",
+                text_config.hidden_size // text_config.num_attention_heads)
+            _head_dim = tpu_utils.get_padded_head_dim(_head_dim_orig)
+            _fp8_attn_pad_cfg = {
+                "q_proj": (text_config.num_attention_heads, _head_dim),
+                "k_proj": (text_config.num_key_value_heads, _head_dim),
+                "v_proj": (text_config.num_key_value_heads, _head_dim),
+            }
+
+            # Strip reshape/transpose/pad for attention projections:
+            # these are designed for BF16 3D layouts and must not be applied
+            # to FP8's 2D kernels (padding is handled in pre-processing above).
+            from dataclasses import replace as _dc_replace
+            _attn_keys = {"q_proj", "k_proj", "v_proj", "o_proj"}
+            _attn_bias_keys = {f"{k}.bias" for k in _attn_keys}
+            metadata_map = _dc_replace(
+                metadata_map,
+                reshape_map={k: v for k, v in metadata_map.reshape_map.items()
+                             if k not in _attn_keys},
+                transpose_map={k: v for k, v in metadata_map.transpose_map.items()
+                               if k not in _attn_keys},
+                pad_map={k: v for k, v in metadata_map.pad_map.items()
+                         if k not in _attn_keys},
+                bias_reshape_map={k: v for k, v in metadata_map.bias_reshape_map.items()
+                                  if k not in _attn_bias_keys},
+                bias_pad_map={k: v for k, v in metadata_map.bias_pad_map.items()
+                              if k not in _attn_bias_keys},
+            )
+
         # Get model state for direct parameter manipulation (expert loading).
         params = nnx.state(self)
         try:
@@ -623,35 +707,176 @@ class Qwen3VLMoeForConditionalGeneration(nnx.Module):
         weights_files = get_model_weights_files(
             model_config.model, self.vllm_config.load_config.download_dir)
 
-        for weights_file in weights_files:
-            for hf_key, hf_weight in model_weights_single_file_generator(
-                    weights_file, framework="flax"):
-                # MoE expert bulk weights are handled with custom split logic.
-                if ("mlp.experts.gate_up_proj" in hf_key
-                        and "language_model" in hf_key):
-                    self._load_bulk_gate_up_proj(
-                        params, shardings, hf_key, hf_weight)
-                    continue
-                elif ("mlp.experts.down_proj" in hf_key
-                      and "language_model" in hf_key):
-                    self._load_bulk_down_proj(
-                        params, shardings, hf_key, hf_weight)
-                    continue
-                elif ("mlp.gate.weight" in hf_key
-                      and "language_model" in hf_key):
-                    self._load_gate_weight(
-                        params, shardings, hf_key, hf_weight)
-                    continue
-
-                # Standard loading for all other weights.
-                _load_and_shard_weight(
-                    self.vllm_config, params, shardings, metadata_map,
-                    self.mesh, hf_key, hf_weight, keep_suffix,
-                    pp_missing_layers=self.pp_missing_layers)
+        # Load all files in parallel (up to 64 threads, matching load_hf_weights).
+        # Each thread processes one safetensors file independently; params from
+        # different files write to different VariableState objects so there is no
+        # data race.
+        max_workers = min(64, len(weights_files))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    self._load_single_weights_file,
+                    weights_file,
+                    params,
+                    shardings,
+                    metadata_map,
+                    keep_suffix,
+                    _fp8_attn_pad_cfg,
+                    keep_original_dtype_keys_regex,
+                ): weights_file
+                for weights_file in weights_files
+            }
+            for future in as_completed(futures):
+                future.result()  # re-raise any exception from the worker
 
         check_all_loaded(params)
         nnx.update(self, params)
+        if is_fp8:
+            self._process_fp8_attn_weights_after_loading()
+            self._process_fp8_moe_weights_after_loading()
         self._fuse_moe_expert_weights()
+
+    def _load_single_weights_file(
+        self,
+        weights_file: str,
+        params,
+        shardings,
+        metadata_map,
+        keep_suffix: list,
+        fp8_attn_pad_cfg: dict,
+        keep_original_dtype_keys_regex,
+    ) -> None:
+        """Load all weights from one safetensors file (called from a thread pool).
+
+        Each safetensors file covers a disjoint set of layer parameters, so
+        concurrent calls writing to different VariableState objects are safe.
+        """
+        for hf_key, hf_weight in model_weights_single_file_generator(
+                weights_file, framework="flax"):
+            # MoE expert bulk weights are handled with custom split logic.
+            # NOTE: scale_inv checks must come before weight checks because
+            # "mlp.experts.gate_up_proj_scale_inv" contains "gate_up_proj" as
+            # a substring, which would misroute it to _load_bulk_gate_up_proj.
+            if ("mlp.experts.gate_up_proj_scale_inv" in hf_key
+                    and "language_model" in hf_key):
+                self._load_bulk_moe_scale_inv_gate_up(
+                    params, shardings, hf_key, hf_weight)
+                continue
+            elif ("mlp.experts.down_proj_scale_inv" in hf_key
+                  and "language_model" in hf_key):
+                self._load_bulk_moe_scale_inv_down(
+                    params, shardings, hf_key, hf_weight)
+                continue
+            elif ("mlp.experts.gate_up_proj" in hf_key
+                    and "language_model" in hf_key):
+                self._load_bulk_gate_up_proj(
+                    params, shardings, hf_key, hf_weight)
+                continue
+            elif ("mlp.experts.down_proj" in hf_key
+                  and "language_model" in hf_key):
+                self._load_bulk_down_proj(
+                    params, shardings, hf_key, hf_weight)
+                continue
+            elif ("mlp.gate.weight" in hf_key
+                  and "language_model" in hf_key
+                  and "weight_scale_inv" not in hf_key):
+                self._load_gate_weight(
+                    params, shardings, hf_key, hf_weight)
+                continue
+
+            # FP8 attention projection weights: pad num_heads to the mesh
+            # sharding multiple.  HF stores unpadded 2D weights; the JAX
+            # model expects padded 2D weights (Fp8BlockwiseLinearMethod
+            # kernel_shape = (out_padded, in_flat)).
+            # Same padding applies to weight_scale_inv (block rows follow
+            # the same head structure, so the repeat factor is identical).
+            # Only applies to language-model keys (vision uses different
+            # key names that don't match fp8_attn_pad_cfg).
+            if fp8_attn_pad_cfg and "language_model" in hf_key:
+                _sharding_size = self.mesh.shape["model"]
+                for _proj, (_num_heads_orig, _head_dim) in \
+                        fp8_attn_pad_cfg.items():
+                    _padded_heads = tpu_utils.get_padded_num_heads(
+                        _num_heads_orig, _sharding_size)
+                    _repeat = _padded_heads // _num_heads_orig
+                    if _repeat <= 1:
+                        continue
+                    if f".{_proj}.weight_scale_inv" in hf_key:
+                        hf_weight = jnp.asarray(hf_weight)
+                        hf_weight = jnp.repeat(hf_weight, _repeat, axis=0)
+                        break
+                    elif f".{_proj}.weight" in hf_key or \
+                            hf_key.endswith(f".{_proj}"):
+                        _src = hf_weight.shape[0]
+                        _tgt = _padded_heads * _head_dim
+                        if _src != _tgt:
+                            hf_weight = jnp.asarray(hf_weight)
+                            hf_weight = hf_weight.reshape(
+                                _num_heads_orig, _head_dim, -1)
+                            hf_weight = jnp.repeat(
+                                hf_weight, _repeat, axis=0)
+                            hf_weight = hf_weight.reshape(_tgt, -1)
+                        break
+
+            # Standard loading for all other weights.
+            try:
+                _load_and_shard_weight(
+                    self.vllm_config, params, shardings, metadata_map,
+                    self.mesh, hf_key, hf_weight, keep_suffix,
+                    keep_original_dtype_keys_regex=keep_original_dtype_keys_regex,
+                    pp_missing_layers=self.pp_missing_layers)
+            except (ValueError, Exception) as _e:
+                raise type(_e)(
+                    f"[qwen3_vl_moe] error loading hf_key={hf_key!r} "
+                    f"shape={tuple(hf_weight.shape)} dtype={hf_weight.dtype}: {_e}"
+                ) from _e
+
+    def _process_fp8_attn_weights_after_loading(self) -> None:
+        """Set _is_loaded and run process_weights_after_loading for FP8 attention projections.
+
+        load_weights uses the generic _load_and_shard_weight path, which
+        directly assigns param.value without invoking the weight_loader or
+        setting the _is_loaded metadata flag.  Fp8BlockwiseLinearMethod
+        .process_weights_after_loading gates on that flag, so we set it
+        manually on both weight and weight_scale_inv, then trigger the
+        per-projection requantization (CPU dequant → requant → device shard).
+        """
+        from tpu_inference.layers.jax.quantization.fp8 import (
+            Fp8BlockwiseLinearMethod)
+        processed = 0
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            attn = layer.self_attn
+            for proj_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                proj = getattr(attn, proj_name, None)
+                if proj is None:
+                    continue
+                if not isinstance(getattr(proj, "quant_method", None),
+                                  Fp8BlockwiseLinearMethod):
+                    continue
+                # _load_and_shard_weight placed the weights on TPU (using
+                # self.mesh) but process_weights_after_loading runs inside
+                # cpu_mesh_context() and expects CPU arrays. Move to CPU first.
+                _cpu_shard = jax.sharding.SingleDeviceSharding(
+                    jax.devices("cpu")[0])
+                if hasattr(proj, "weight"):
+                    proj.weight.set_metadata("_is_loaded", True)
+                    proj.weight.value = jax.device_put(proj.weight[...],
+                                                       _cpu_shard)
+                if hasattr(proj, "weight_scale_inv"):
+                    proj.weight_scale_inv.set_metadata("_is_loaded", True)
+                    proj.weight_scale_inv.value = jax.device_put(
+                        proj.weight_scale_inv[...], _cpu_shard)
+                ok = proj.quant_method.process_weights_after_loading(proj)
+                if not ok:
+                    logger.warning(
+                        "process_weights_after_loading returned False for "
+                        f"{proj_name} in layer — weight or scale not loaded.")
+                else:
+                    processed += 1
+        logger.info(
+            f"Processed FP8 attention weights for {processed} projections.")
 
     def _fuse_moe_expert_weights(self) -> None:
         """Fuse kernel_gating_EDF + kernel_up_proj_EDF → kernel_gating_upproj_EDF.
@@ -671,6 +896,10 @@ class Qwen3VLMoeForConditionalGeneration(nnx.Module):
         fused_count = 0
         for _path, module in nnx.iter_graph(self):
             if not isinstance(module, JaxMoE):
+                continue
+            if not hasattr(module, "kernel_gating_EDF"):
+                # FP8: process_weights_after_loading already fused gate+up into
+                # kernel_gating_upproj_EDF and deleted kernel_gating_EDF.
                 continue
             w_gate = module.kernel_gating_EDF.value  # (E, F, D) as stored by bulk loader
             w_up = module.kernel_up_proj_EDF.value   # (E, F, D) as stored by bulk loader
@@ -706,7 +935,11 @@ class Qwen3VLMoeForConditionalGeneration(nnx.Module):
 
         dtype = self.vllm_config.model_config.dtype
         weight = jnp.asarray(hf_weight)
-        if weight.dtype != dtype:
+        from tpu_inference.layers.jax.quantization.fp8 import Fp8Config
+        is_fp8 = (isinstance(self.vllm_config.quant_config, Fp8Config)
+                  or getattr(self.vllm_config.model_config, "quantization",
+                              None) == "fp8")
+        if not is_fp8 and weight.dtype != dtype:
             weight = weight.astype(dtype)
 
         # weight shape: (E, D, 2*F)
@@ -719,12 +952,30 @@ class Qwen3VLMoeForConditionalGeneration(nnx.Module):
         gate_efd = jnp.swapaxes(gate_half, 1, 2)  # (E, F, D)
         up_efd = jnp.swapaxes(up_half, 1, 2)      # (E, F, D)
 
-        for jax_suffix, kernel_weight in [
-            ("mlp.experts.kernel_gating_EDF", gate_efd),
-            ("mlp.experts.kernel_up_proj_EDF", up_efd),
-        ]:
-            jax_key = f"model.layers.{layer_num}.{jax_suffix}"
-            self._store_expert_kernel(params, shardings, jax_key, kernel_weight)
+        if is_fp8:
+            # FP8: store CPU arrays directly (no shard_put to TPU).
+            # _process_fp8_moe_weights_after_loading reads them from the live
+            # model after nnx.update and handles fusion + re-sharding to TPU.
+            for jax_suffix, kernel_weight in [
+                ("mlp.experts.kernel_gating_EDF", gate_efd),
+                ("mlp.experts.kernel_up_proj_EDF", up_efd),
+            ]:
+                jax_key = f"model.layers.{layer_num}.{jax_suffix}"
+                try:
+                    param, _ = get_param_and_sharding(params, shardings,
+                                                       jax_key)
+                except ValueError:
+                    logger.warning(f"Skip {jax_key}: param not found.")
+                    continue
+                param.value = kernel_weight  # CPU jax array; will be fused later
+        else:
+            for jax_suffix, kernel_weight in [
+                ("mlp.experts.kernel_gating_EDF", gate_efd),
+                ("mlp.experts.kernel_up_proj_EDF", up_efd),
+            ]:
+                jax_key = f"model.layers.{layer_num}.{jax_suffix}"
+                self._store_expert_kernel(params, shardings, jax_key,
+                                          kernel_weight)
 
     def _load_bulk_down_proj(
         self,
@@ -747,14 +998,28 @@ class Qwen3VLMoeForConditionalGeneration(nnx.Module):
 
         dtype = self.vllm_config.model_config.dtype
         weight = jnp.asarray(hf_weight)
-        if weight.dtype != dtype:
+        from tpu_inference.layers.jax.quantization.fp8 import Fp8Config
+        is_fp8 = (isinstance(self.vllm_config.quant_config, Fp8Config)
+                  or getattr(self.vllm_config.model_config, "quantization",
+                              None) == "fp8")
+        if not is_fp8 and weight.dtype != dtype:
             weight = weight.astype(dtype)
 
         # weight shape: (E, F, D) → transpose to (E, D, F)
         down_edf = jnp.swapaxes(weight, 1, 2)  # (E, D, F)
 
         jax_key = f"model.layers.{layer_num}.mlp.experts.kernel_down_proj_EFD"
-        self._store_expert_kernel(params, shardings, jax_key, down_edf)
+        if is_fp8:
+            # FP8: store CPU array directly; will be fused by
+            # _process_fp8_moe_weights_after_loading.
+            try:
+                param, _ = get_param_and_sharding(params, shardings, jax_key)
+            except ValueError:
+                logger.warning(f"Skip {jax_key}: param not found.")
+                return
+            param.value = down_edf  # CPU jax array
+        else:
+            self._store_expert_kernel(params, shardings, jax_key, down_edf)
 
     def _load_gate_weight(
         self,
@@ -819,3 +1084,167 @@ class Qwen3VLMoeForConditionalGeneration(nnx.Module):
             return
         spec = sharding.spec if isinstance(sharding, NamedSharding) else sharding
         param.value = shard_put(kernel_weight, spec, mesh=self.mesh)
+
+    def _load_bulk_moe_scale_inv_gate_up(
+        self,
+        params,
+        shardings,
+        hf_key: str,
+        hf_weight,
+    ) -> None:
+        """Load gate_up_proj_scale_inv (E, D_blocks, 2*F_blocks) into JaxMoE.
+
+        Splits along the last axis into gate and up halves, then transposes each
+        half from (E, D_blocks, F_blocks) to (E, F_blocks, D_blocks) to match
+        the per-expert layout used by _process_fp8_moe_weights_after_loading.
+        Stores CPU arrays in VariableState.value for:
+          kernel_gating_EDF_weight_scale_inv
+          kernel_up_proj_EDF_weight_scale_inv
+        """
+        m = re.search(r"layers\.(\d+)", hf_key)
+        if m is None:
+            logger.warning(f"Cannot extract layer number from {hf_key}; skipping.")
+            return
+        layer_num = int(m.group(1))
+
+        scale = jnp.asarray(hf_weight)  # (E, D_blocks, 2*F_blocks), CPU
+        _two_F_blocks = scale.shape[2]
+        F_blocks = _two_F_blocks // 2
+
+        # Split and transpose: (E, D_blocks, F_blocks) → (E, F_blocks, D_blocks)
+        gate_scale = jnp.swapaxes(scale[:, :, :F_blocks], 1, 2)
+        up_scale = jnp.swapaxes(scale[:, :, F_blocks:], 1, 2)
+
+        jax_prefix = f"model.layers.{layer_num}.mlp.experts"
+        for jax_suffix, scale_weight in [
+            ("kernel_gating_EDF_weight_scale_inv", gate_scale),
+            ("kernel_up_proj_EDF_weight_scale_inv", up_scale),
+        ]:
+            jax_key_out = f"{jax_prefix}.{jax_suffix}"
+            try:
+                param, _ = get_param_and_sharding(params, shardings, jax_key_out)
+            except ValueError:
+                logger.warning(f"Skip {jax_key_out}: param not found.")
+                continue
+            param.value = scale_weight  # CPU jax array
+
+    def _load_bulk_moe_scale_inv_down(
+        self,
+        params,
+        shardings,
+        hf_key: str,
+        hf_weight,
+    ) -> None:
+        """Load down_proj_scale_inv (E, F_blocks, D_blocks) into JaxMoE.
+
+        HF bulk layout is (E, F_blocks, D_blocks).  The down weight is loaded
+        as (E, D, F) (see _load_bulk_down_proj), so the scale for
+        dequantize_tensor(w2, scale, axes=(1,2)) must be (E, D_blocks, F_blocks).
+        Transpose axes 1 and 2 to convert.
+        """
+        m = re.search(r"layers\.(\d+)", hf_key)
+        if m is None:
+            logger.warning(f"Cannot extract layer number from {hf_key}; skipping.")
+            return
+        layer_num = int(m.group(1))
+
+        # HF: (E, F_blk, D_blk) → transpose → (E, D_blk, F_blk)
+        scale = jnp.swapaxes(jnp.asarray(hf_weight), 1, 2)
+        jax_key_out = (f"model.layers.{layer_num}.mlp.experts"
+                       ".kernel_down_proj_EFD_weight_scale_inv")
+        try:
+            param, _ = get_param_and_sharding(params, shardings, jax_key_out)
+        except ValueError:
+            logger.warning(f"Skip {jax_key_out}: param not found.")
+            return
+        param.value = scale  # CPU jax array, shape (E, D_blk, F_blk)
+
+    def _process_fp8_moe_weights_after_loading(self) -> None:
+        """Fuse and requantize FP8 MoE expert weights after bulk loading.
+
+        Bulk loading stores CPU arrays in param.value for:
+          - kernel_gating_EDF / kernel_up_proj_EDF / kernel_down_proj_EFD (fp8)
+          - kernel_*_weight_scale_inv (float32)
+        This method reads those values from the live model (after nnx.update),
+        fuses gate+up into kernel_gating_upproj_EDF, calls process_fp8_moe_weights
+        for requantization, and shards the final arrays onto the TPU mesh.
+        """
+        from tpu_inference.layers.common.process_weights.moe_weights import (
+            FusedMoEWeights, process_fp8_moe_weights)
+        from tpu_inference.layers.common.utils import cpu_mesh_context
+        from tpu_inference.layers.jax.quantization.fp8 import Fp8FusedMoEMethod
+        processed = 0
+        for _path, module in nnx.iter_graph(self):
+            if not isinstance(module, JaxMoE):
+                continue
+            qm = getattr(module, "quant_method", None)
+            if not isinstance(qm, Fp8FusedMoEMethod):
+                continue
+
+            weight_scale_name = qm.weight_scale_name  # "weight_scale_inv"
+            gating_scale_name = f"kernel_gating_EDF_{weight_scale_name}"
+            up_scale_name = f"kernel_up_proj_EDF_{weight_scale_name}"
+            down_scale_name = f"kernel_down_proj_EFD_{weight_scale_name}"
+
+            # All kernel and scale values are CPU arrays (set by bulk loaders
+            # and propagated by nnx.update). Fuse and requantize on CPU, then
+            # shard to TPU.
+            with cpu_mesh_context():
+                w_gate = module.kernel_gating_EDF[...]    # (E, F, D) fp8
+                w_up = module.kernel_up_proj_EDF[...]     # (E, F, D) fp8
+                s_gate = getattr(module, gating_scale_name)[...]  # (E, F_blk, D_blk)
+                s_up = getattr(module, up_scale_name)[...]
+                w2 = module.kernel_down_proj_EFD[...]     # (E, D, F) fp8
+                s_down = getattr(module, down_scale_name)[...]    # (E, F_blk, D_blk)
+
+                # Fuse gate+up along expert-feature axis → (E, 2F, D)
+                w13_weight = jnp.concatenate([w_gate, w_up], axis=1)
+                w13_scale = jnp.concatenate([s_gate, s_up], axis=1)
+
+                weights = process_fp8_moe_weights(
+                    FusedMoEWeights(
+                        w13_weight=w13_weight,
+                        w13_weight_scale=w13_scale,
+                        w13_bias=None,
+                        w2_weight=w2,
+                        w2_weight_scale=s_down,
+                        w2_bias=None,
+                    ),
+                    moe_backend=module.moe_backend,
+                    mesh=module.mesh,
+                    activation=module.activation,
+                    weight_block_size=None,  # infer from scale shape
+                )
+
+            # Replace intermediate params with final fused+sharded params.
+            del module.kernel_gating_EDF
+            del module.kernel_up_proj_EDF
+            delattr(module, gating_scale_name)
+            delattr(module, up_scale_name)
+
+            edf_scale_sharding = (
+                (module.edf_sharding[0], )
+                + (None, ) * (weights.w13_weight_scale.ndim - 2)
+                + (module.edf_sharding[-1], ))
+            efd_scale_sharding = (
+                (module.efd_sharding[0], )
+                + (None, ) * (weights.w2_weight_scale.ndim - 2)
+                + (module.efd_sharding[-1], ))
+
+            module.kernel_gating_upproj_EDF = nnx.Param(
+                shard_put(weights.w13_weight, shardings=module.edf_sharding))
+            module.kernel_down_proj_EFD = nnx.Param(
+                shard_put(weights.w2_weight, shardings=module.efd_sharding))
+            setattr(
+                module, f"kernel_gating_upproj_EDF_{weight_scale_name}",
+                nnx.Param(
+                    shard_put(weights.w13_weight_scale,
+                              shardings=edf_scale_sharding)))
+            setattr(
+                module, f"kernel_down_proj_EFD_{weight_scale_name}",
+                nnx.Param(
+                    shard_put(weights.w2_weight_scale,
+                              shardings=efd_scale_sharding)))
+            processed += 1
+        logger.info(
+            f"Processed FP8 MoE weights for {processed} JaxMoE modules.")
