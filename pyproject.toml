@@ -11,3 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    # SWIG C-extension types lack __module__ in Python 3.12; harmless.
+    "ignore:builtin type Swig.*has no __module__:DeprecationWarning",
+    "ignore:builtin type swigvarlink has no __module__:DeprecationWarning",
+]

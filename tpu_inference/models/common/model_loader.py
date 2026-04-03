@@ -78,6 +78,8 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     from tpu_inference.models.jax.qwen3_moe import Qwen3MoeForCausalLM
     from tpu_inference.models.jax.qwen3_vl import \
         Qwen3VLForConditionalGeneration
+    from tpu_inference.models.jax.qwen3_vl_moe import \
+        Qwen3VLMoeForConditionalGeneration
     _MODEL_REGISTRY["ChatGLMModel"] = ChatGLMForCausalLM
     _MODEL_REGISTRY["Glm4MoeForCausalLM"] = Glm4MoeForCausalLM
     _MODEL_REGISTRY["GlmMoeDsaForCausalLM"] = Glm5ForCausalLM
@@ -91,6 +93,8 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
         "Qwen2_5_VLForConditionalGeneration"] = Qwen2_5_VLForConditionalGeneration
     _MODEL_REGISTRY[
         "Qwen3VLForConditionalGeneration"] = Qwen3VLForConditionalGeneration
+    _MODEL_REGISTRY[
+        "Qwen3VLMoeForConditionalGeneration"] = Qwen3VLMoeForConditionalGeneration
     _MODEL_REGISTRY["Eagle3LlamaForCausalLM"] = EagleLlama3ForCausalLM
     _MODEL_REGISTRY["GptOssForCausalLM"] = GptOss
     _MODEL_REGISTRY["Qwen2ForCausalLM"] = Qwen2ForCausalLM
