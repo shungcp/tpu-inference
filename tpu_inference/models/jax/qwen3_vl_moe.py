@@ -201,7 +201,7 @@ class Qwen3VLMoeForConditionalGeneration(nnx.Module):
         self.model = Qwen3VLMoeTextModel(
             vllm_config=vllm_config, rng=self.rng, mesh=mesh)
 
-        if not text_config.tie_word_embeddings:
+        if not hf_config.tie_word_embeddings:
             if self.is_last_rank:
                 vocab_size = vllm_config.model_config.get_vocab_size()
                 self.lm_head = JaxEinsum(
