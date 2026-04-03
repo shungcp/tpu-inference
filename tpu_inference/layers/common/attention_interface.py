@@ -439,6 +439,29 @@ def attention(
 
     md = attention_metadata
 
+    # Cast q/k/v to a common compute dtype if necessary.
+    # Some models (e.g. GLM-4.5-Air) promote q/k/v to float32 during RoPE;
+    # the RPA kernel requires q/k/v to share the same dtype.
+    # For FP8 models, k/v are already quantized to fp8 by quantize_kv() before
+    # this function; q must stay in the original compute dtype (bf16), NOT be
+    # cast to fp8, because the RPA kernel's q_packing logic breaks with fp8 q.
+    kv_dtype = kv_cache.dtype
+    is_fp8_cache = kv_dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2)
+    if not is_fp8_cache:
+        # Non-quantized cache: cast q/k/v to match kv_cache dtype (e.g. bf16).
+        if q.dtype != kv_dtype:
+            q = q.astype(kv_dtype)
+        if k.dtype != kv_dtype:
+            k = k.astype(kv_dtype)
+        if v.dtype != kv_dtype:
+            v = v.astype(kv_dtype)
+    else:
+        # FP8 cache: k/v already in fp8 from quantize_kv(); ensure q stays
+        # in the model compute dtype. If q was promoted (e.g. to float32),
+        # cast it back to bfloat16.
+        if q.dtype == jnp.float32:
+            q = q.astype(jnp.bfloat16)
+
     # (T, N, H)
     output, kv_cache = sharded_ragged_paged_attention(
         mesh,
