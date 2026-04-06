@@ -52,12 +52,17 @@ def _weight_cache_exists(cache_dir: str) -> bool:
     if not cache_dir:
         return False
     proc_dir = os.path.join(cache_dir, f"proc_{jax.process_index()}")
-    return os.path.isfile(os.path.join(proc_dir, "meta.pkl"))
+    return os.path.isfile(os.path.join(proc_dir, "meta.json"))
 
 
 def _save_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
-    """Save model weights per-process using numpy files."""
-    import pickle
+    """Save model weights per-process using numpy files.
+
+    Only JAX arrays are saved.  The tree structure and non-array metadata
+    (variable types, initializers, partition specs) are NOT pickled — they
+    are reconstructed from the abstract model on restore.
+    """
+    import json
     import numpy as np
 
     proc_idx = jax.process_index()
@@ -65,64 +70,76 @@ def _save_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
     os.makedirs(proc_dir, exist_ok=True)
 
     _, state = nnx.split(model)
-    flat, treedef = jax.tree.flatten(state)
+    flat = jax.tree.leaves(state)
 
-    meta_entries = []
-    array_count = 0
+    # Identify which leaves are JAX arrays and save them
+    array_indices = []
     for i, leaf in enumerate(flat):
         if isinstance(leaf, jax.Array):
             shard_dict = {}
             for s in leaf.addressable_shards:
                 shard_dict[f"d{s.device.id}"] = np.array(s.data)
             np.savez(os.path.join(proc_dir, f"a{i}.npz"), **shard_dict)
-            meta_entries.append(
-                ('array', i, leaf.shape, str(leaf.dtype),
-                 leaf.sharding.spec if hasattr(leaf.sharding, 'spec') else None))
-            array_count += 1
-        else:
-            meta_entries.append(('other', i, leaf))
+            array_indices.append(i)
 
-    with open(os.path.join(proc_dir, "meta.pkl"), "wb") as f:
-        pickle.dump({'treedef': treedef, 'entries': meta_entries}, f,
-                    protocol=pickle.HIGHEST_PROTOCOL)
+    # Save only the array index list (plain JSON, no pickle needed)
+    with open(os.path.join(proc_dir, "meta.json"), "w") as f:
+        json.dump({'array_indices': array_indices, 'num_leaves': len(flat)}, f)
     logger.info("Weight cache saved: %s (process %d, %d arrays)",
-                proc_dir, proc_idx, array_count)
+                proc_dir, proc_idx, len(array_indices))
 
 
 def _restore_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
-    """Restore model weights per-process from numpy files."""
-    import pickle
+    """Restore model weights per-process from numpy files.
+
+    The tree structure comes from the abstract *model* (already created via
+    ``nnx.eval_shape``).  We only replace the JAX-array leaves with data
+    loaded from cache.
+    """
+    import json
     import numpy as np
 
     proc_idx = jax.process_index()
     proc_dir = os.path.join(cache_dir, f"proc_{proc_idx}")
 
-    with open(os.path.join(proc_dir, "meta.pkl"), "rb") as f:
-        saved = pickle.load(f)
+    with open(os.path.join(proc_dir, "meta.json")) as f:
+        meta = json.load(f)
+
+    # Get the abstract model's state — this provides treedef + non-array leaves
+    _, abstract_state = nnx.split(model)
+    flat_abstract = jax.tree.leaves(abstract_state)
 
     local_devices = {d.id: d for d in jax.local_devices()}
-    flat = [None] * len(saved['entries'])
+    array_set = set(meta['array_indices'])
 
-    for entry in saved['entries']:
-        if entry[0] == 'array':
-            _, idx, shape, dtype_str, pspec = entry
-            data = dict(np.load(os.path.join(proc_dir, f"a{idx}.npz")))
-            sharding = NamedSharding(mesh, pspec) if pspec is not None \
-                else NamedSharding(mesh, PartitionSpec())
-            per_device = []
-            for dev_id in sorted(local_devices.keys()):
-                per_device.append(
-                    jax.device_put(data[f"d{dev_id}"], local_devices[dev_id]))
-            arr = jax.make_array_from_single_device_arrays(
-                shape, sharding, per_device)
-            flat[idx] = arr
-        else:
-            _, idx, value = entry
-            flat[idx] = value
+    # Build replacement map: leaf index → loaded JAX array
+    replacements = {}
+    for idx in meta['array_indices']:
+        data = dict(np.load(os.path.join(proc_dir, f"a{idx}.npz")))
+        # Get shape and sharding from the abstract leaf
+        abstract_leaf = flat_abstract[idx]
+        shape = abstract_leaf.shape
+        sharding = abstract_leaf.sharding if hasattr(abstract_leaf, 'sharding') \
+            else NamedSharding(mesh, PartitionSpec())
+        per_device = []
+        for dev_id in sorted(local_devices.keys()):
+            per_device.append(
+                jax.device_put(data[f"d{dev_id}"], local_devices[dev_id]))
+        replacements[idx] = jax.make_array_from_single_device_arrays(
+            shape, sharding, per_device)
 
-    state = saved['treedef'].unflatten(flat)
-    nnx.update(model, state)
-    logger.info("Weight cache restored: %s (process %d)", proc_dir, proc_idx)
+    # Replace array leaves in the abstract state
+    leaf_counter = [0]
+
+    def _replace(leaf):
+        i = leaf_counter[0]
+        leaf_counter[0] += 1
+        return replacements[i] if i in replacements else leaf
+
+    restored_state = jax.tree.map(_replace, abstract_state)
+    nnx.update(model, restored_state)
+    logger.info("Weight cache restored: %s (process %d, %d arrays)",
+                proc_dir, proc_idx, len(replacements))
 
 _MODEL_REGISTRY = {}
 
