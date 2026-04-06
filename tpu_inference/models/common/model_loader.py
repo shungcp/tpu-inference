@@ -74,6 +74,7 @@ def _save_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
 
     # Identify which leaves are JAX arrays and save them
     array_indices = []
+    array_dtypes = {}  # str(idx) -> dtype string
     for i, leaf in enumerate(flat):
         if isinstance(leaf, jax.Array):
             shard_dict = {}
@@ -81,10 +82,12 @@ def _save_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
                 shard_dict[f"d{s.device.id}"] = np.array(s.data)
             np.savez(os.path.join(proc_dir, f"a{i}.npz"), **shard_dict)
             array_indices.append(i)
+            array_dtypes[str(i)] = str(leaf.dtype)
 
-    # Save only the array index list (plain JSON, no pickle needed)
+    # Save array index list + dtypes (plain JSON, no pickle needed)
     with open(os.path.join(proc_dir, "meta.json"), "w") as f:
-        json.dump({'array_indices': array_indices, 'num_leaves': len(flat)}, f)
+        json.dump({'array_indices': array_indices, 'num_leaves': len(flat),
+                   'array_dtypes': array_dtypes}, f)
     logger.info("Weight cache saved: %s (process %d, %d arrays)",
                 proc_dir, proc_idx, len(array_indices))
 
@@ -113,6 +116,8 @@ def _restore_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
     array_set = set(meta['array_indices'])
 
     # Build replacement map: leaf index → loaded JAX array
+    import jax.numpy as jnp
+    array_dtypes = meta.get('array_dtypes', {})
     replacements = {}
     for idx in meta['array_indices']:
         data = dict(np.load(os.path.join(proc_dir, f"a{idx}.npz")))
@@ -121,10 +126,15 @@ def _restore_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
         shape = abstract_leaf.shape
         sharding = abstract_leaf.sharding if hasattr(abstract_leaf, 'sharding') \
             else NamedSharding(mesh, PartitionSpec())
+        # Restore original dtype (npz loses custom dtypes like bfloat16/float8)
+        orig_dtype_str = array_dtypes.get(str(idx))
+        orig_dtype = jnp.dtype(orig_dtype_str) if orig_dtype_str else None
         per_device = []
         for dev_id in sorted(local_devices.keys()):
-            per_device.append(
-                jax.device_put(data[f"d{dev_id}"], local_devices[dev_id]))
+            arr = data[f"d{dev_id}"]
+            if orig_dtype is not None and arr.dtype != orig_dtype:
+                arr = arr.view(orig_dtype)
+            per_device.append(jax.device_put(arr, local_devices[dev_id]))
         replacements[idx] = jax.make_array_from_single_device_arrays(
             shape, sharding, per_device)
 
