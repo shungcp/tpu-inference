@@ -353,44 +353,33 @@ def _get_nnx_model(
         # the model creation again, otherwise the model forward will have
         # non-trivial overhead in PjitFunction.
         with jax.set_mesh(mesh):
-            def _do_load_weights(model, load_format=None):
-                """Run the weight loading pipeline on model."""
-                fmt = load_format or vllm_config.load_config.load_format
-                orig_format = vllm_config.load_config.load_format
-                vllm_config.load_config.load_format = fmt
-                try:
-                    if fmt == "dummy":
-                        vllm_config.load_config.load_format = "jax_dummy"
-                    loader = get_model_loader(vllm_config.load_config)
-                    if isinstance(model, LoadableWithIterator):
-                        assert isinstance(model, JaxModule)
-                        loader.load_weights(model, vllm_config.model_config)
-                    elif isinstance(loader, RunaiModelStreamerLoader):
-                        model_weights = vllm_config.model_config.model
-                        if hasattr(vllm_config.model_config, "model_weights"):
-                            model_weights = vllm_config.model_config.model_weights
-                        weights_iterator = loader._get_weights_iterator(
-                            model_weights,
-                            vllm_config.model_config.revision)
-                        vllm_config.model_config.runai_model_weights_iterator = weights_iterator
-                        model.load_weights(rng)
-                        del vllm_config.model_config.runai_model_weights_iterator
-                    else:
-                        model.load_weights(rng)
-                finally:
-                    vllm_config.load_config.load_format = orig_format
-
             if _weight_cache_exists(_WEIGHT_CACHE_DIR):
-                # Fast path: dummy load to create model structure (dynamic
-                # submodules like k_up_proj/v_up_proj in MLA), then restore
-                # real weights from cache.
+                # Fast path: create dynamic submodules (e.g. MLA k_up_proj/
+                # v_up_proj) then restore all weights from cache.
                 logger.info("Restoring weights from cache: %s",
                             _WEIGHT_CACHE_DIR)
-                _do_load_weights(model, load_format="dummy")
+                if hasattr(model, '_prepare_for_weight_cache'):
+                    model._prepare_for_weight_cache()
                 _restore_weight_cache(model, _WEIGHT_CACHE_DIR, mesh)
             else:
                 # Normal path: load from safetensors / HF
-                _do_load_weights(model)
+                if vllm_config.load_config.load_format == "dummy":
+                    vllm_config.load_config.load_format = "jax_dummy"
+                loader = get_model_loader(vllm_config.load_config)
+                if isinstance(model, LoadableWithIterator):
+                    assert isinstance(model, JaxModule)
+                    loader.load_weights(model, vllm_config.model_config)
+                elif isinstance(loader, RunaiModelStreamerLoader):
+                    model_weights = vllm_config.model_config.model
+                    if hasattr(vllm_config.model_config, "model_weights"):
+                        model_weights = vllm_config.model_config.model_weights
+                    weights_iterator = loader._get_weights_iterator(
+                        model_weights, vllm_config.model_config.revision)
+                    vllm_config.model_config.runai_model_weights_iterator = weights_iterator
+                    model.load_weights(rng)
+                    del vllm_config.model_config.runai_model_weights_iterator
+                else:
+                    model.load_weights(rng)
                 # Save cache for next run
                 if _WEIGHT_CACHE_DIR:
                     logger.info("Saving weight cache to: %s",

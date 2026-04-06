@@ -331,6 +331,32 @@ class Glm5Attention(JaxModule):
             self.kv_cache_quantized_dtype = utils.get_jax_dtype_from_str_dtype(
                 kv_cache_dtype)
 
+    def _create_mla_submodules(self, quant_config):
+        """Create k_up_proj/v_up_proj shells for weight cache restore.
+
+        Normally these are created dynamically by MLAEinsum.load_weights()
+        during weight loading. This method creates them with dummy weights
+        so the model tree structure matches the cached state.
+        """
+        if hasattr(self, 'k_up_proj'):
+            return
+        A = self.kv_lora_rank
+        N = self.num_heads
+        self.k_up_proj = JaxEinsum(
+            einsum_str="TNH,ANH->TNA",
+            kernel_shape=(A, N, self.qk_nope_head_dim),
+            rngs=nnx.Rngs(0),
+            prefix=self.prefix + ".k_up_proj",
+            quant_config=quant_config,
+        )
+        self.v_up_proj = JaxEinsum(
+            einsum_str="TNA,ANH->TNH",
+            kernel_shape=(A, N, self.v_head_dim),
+            rngs=nnx.Rngs(0),
+            prefix=self.prefix + ".v_up_proj",
+            quant_config=quant_config,
+        )
+
     def __call__(
         self,
         kv_cache: Optional[jax.Array],
@@ -870,6 +896,18 @@ class Glm5ForCausalLM(JaxModule, LoadableWithIterator):
             x = JaxIntermediateTensors(tensors={"hidden_states": x})
 
         return kv_caches, x, []
+
+    def _prepare_for_weight_cache(self):
+        """Create dynamic MLA submodules for weight cache restore.
+
+        MLAEinsum.load_weights() normally creates k_up_proj/v_up_proj via
+        setattr during weight loading. When restoring from cache, load_weights
+        is skipped, so we must create these submodule shells beforehand.
+        """
+        quant_config = self.vllm_config.quant_config
+        for layer in self.model.layers:
+            if hasattr(layer, 'self_attn'):
+                layer.self_attn._create_mla_submodules(quant_config)
 
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
         return self.lm_head(hidden_states)
