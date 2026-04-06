@@ -124,8 +124,10 @@ def _restore_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
         # Get shape and sharding from the abstract leaf
         abstract_leaf = flat_abstract[idx]
         shape = abstract_leaf.shape
-        sharding = abstract_leaf.sharding if hasattr(abstract_leaf, 'sharding') \
-            else NamedSharding(mesh, PartitionSpec())
+        if hasattr(abstract_leaf, 'sharding') and hasattr(abstract_leaf.sharding, 'spec'):
+            sharding = NamedSharding(mesh, abstract_leaf.sharding.spec)
+        else:
+            sharding = NamedSharding(mesh, PartitionSpec())
         # Restore original dtype (npz loses custom dtypes like bfloat16/float8)
         orig_dtype_str = array_dtypes.get(str(idx))
         orig_dtype = jnp.dtype(orig_dtype_str) if orig_dtype_str else None
