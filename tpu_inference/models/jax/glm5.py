@@ -335,8 +335,9 @@ class Glm5Attention(JaxModule):
         """Create k_up_proj/v_up_proj shells for weight cache restore.
 
         Normally these are created dynamically by MLAEinsum.load_weights()
-        during weight loading. This method creates them with dummy weights
-        so the model tree structure matches the cached state.
+        during weight loading, which also deletes kv_b_proj's weight and
+        weight_scale_inv. This method replicates that structural change
+        so the model tree matches the cached state exactly.
         """
         if hasattr(self, 'k_up_proj'):
             return
@@ -356,6 +357,15 @@ class Glm5Attention(JaxModule):
             prefix=self.prefix + ".v_up_proj",
             quant_config=quant_config,
         )
+        # MLAEinsum.load_weights deletes these after decomposition.
+        # Must mirror that here so the tree structure matches the saved cache.
+        kv_b = self.kv_b_proj
+        if hasattr(kv_b, 'weight'):
+            delattr(kv_b, 'weight')
+        if hasattr(kv_b, 'weight_scale_inv'):
+            delattr(kv_b, 'weight_scale_inv')
+        if hasattr(kv_b, 'quant_method'):
+            delattr(kv_b, 'quant_method')
 
     def __call__(
         self,
