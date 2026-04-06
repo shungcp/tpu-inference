@@ -74,7 +74,9 @@ def _save_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
 
     # Identify which leaves are JAX arrays and save them
     array_indices = []
-    array_dtypes = {}  # str(idx) -> dtype string
+    array_dtypes = {}   # str(idx) -> dtype string
+    array_shapes = {}   # str(idx) -> global shape list
+    array_specs = {}    # str(idx) -> PartitionSpec as list (actual runtime spec)
     for i, leaf in enumerate(flat):
         if isinstance(leaf, jax.Array):
             shard_dict = {}
@@ -83,11 +85,17 @@ def _save_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
             np.savez(os.path.join(proc_dir, f"a{i}.npz"), **shard_dict)
             array_indices.append(i)
             array_dtypes[str(i)] = str(leaf.dtype)
+            array_shapes[str(i)] = list(leaf.shape)
+            if hasattr(leaf.sharding, 'spec'):
+                array_specs[str(i)] = list(leaf.sharding.spec)
+            else:
+                array_specs[str(i)] = None
 
-    # Save array index list + dtypes (plain JSON, no pickle needed)
+    # Save array index list + dtypes + shapes + specs
     with open(os.path.join(proc_dir, "meta.json"), "w") as f:
         json.dump({'array_indices': array_indices, 'num_leaves': len(flat),
-                   'array_dtypes': array_dtypes}, f)
+                   'array_dtypes': array_dtypes, 'array_shapes': array_shapes,
+                   'array_specs': array_specs}, f)
     logger.info("Weight cache saved: %s (process %d, %d arrays)",
                 proc_dir, proc_idx, len(array_indices))
 
@@ -118,18 +126,23 @@ def _restore_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
     # Build replacement map: leaf index → loaded JAX array
     import jax.numpy as jnp
     array_dtypes = meta.get('array_dtypes', {})
+    array_shapes = meta.get('array_shapes', {})
+    array_specs = meta.get('array_specs', {})
     replacements = {}
     for idx in meta['array_indices']:
         data = dict(np.load(os.path.join(proc_dir, f"a{idx}.npz")))
-        # Get shape and sharding from the abstract leaf
-        abstract_leaf = flat_abstract[idx]
-        shape = abstract_leaf.shape
-        if hasattr(abstract_leaf, 'sharding') and hasattr(abstract_leaf.sharding, 'spec'):
-            sharding = NamedSharding(mesh, abstract_leaf.sharding.spec)
+        # Use saved shape and sharding spec (not abstract model's, which may differ)
+        idx_str = str(idx)
+        if idx_str in array_shapes:
+            shape = tuple(array_shapes[idx_str])
+        else:
+            shape = flat_abstract[idx].shape
+        if idx_str in array_specs and array_specs[idx_str] is not None:
+            sharding = NamedSharding(mesh, PartitionSpec(*array_specs[idx_str]))
         else:
             sharding = NamedSharding(mesh, PartitionSpec())
         # Restore original dtype (npz loses custom dtypes like bfloat16/float8)
-        orig_dtype_str = array_dtypes.get(str(idx))
+        orig_dtype_str = array_dtypes.get(idx_str)
         orig_dtype = jnp.dtype(orig_dtype_str) if orig_dtype_str else None
         per_device = []
         for dev_id in sorted(local_devices.keys()):
