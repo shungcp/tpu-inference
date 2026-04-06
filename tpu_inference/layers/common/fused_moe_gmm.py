@@ -17,6 +17,7 @@ from typing import Literal
 
 import jax
 from jax import numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
@@ -91,25 +92,110 @@ def moe_gmm_local(
     parallelism: Literal["tp", "ep"],
     sc_kernel_threshold: int,
     sc_kernel_col_chunk_size: int,
+    w1_up: jax.Array | None = None,
 ) -> jax.Array:
     """Main MoE logic on a local shard can run in TP or EP mode.
 
     Set parallelism for "tp" or "ep"
+
+    Args:
+        w1_up: When provided, w1 is the gate weight and w1_up is the up-projection
+            weight, both already per-chip shards (E, D, F/TP).  This avoids slicing
+            a fused (E, D, 2F/TP) tensor inside shard_map, eliminating HLO copy
+            buffers that would otherwise cause OOM.
     """
 
     assert parallelism in ["tp", "ep"]
 
-    # GMM1 computes x @ (W_up | W_gate) together and activation, output is [tokens,padded_intermediate_size]
-    gmm1_res = gmm_wrapper(
-        x,
-        w1,
-        w1_scale,
-        w1_bias,
-        group_sizes,
-        group_offset,
-        fuse_act=activation,
-        preferred_element_type=x.dtype,
-    )
+    if w1_up is not None:
+        # Gate (w1) and up (w1_up) are separate per-chip arrays.
+        # No fuse_act constraint, no slicing, no HLO copy buffers.
+        gate_res = gmm_wrapper(
+            x, w1, w1_scale, w1_bias, group_sizes, group_offset,
+            preferred_element_type=x.dtype,
+        )
+        up_res = gmm_wrapper(
+            x, w1_up, None, None, group_sizes, group_offset,
+            preferred_element_type=x.dtype,
+        )
+        match activation:
+            case "silu":
+                gmm1_res = jax.nn.silu(gate_res) * up_res
+            case "gelu":
+                gmm1_res = jax.nn.gelu(gate_res) * up_res
+            case _:
+                raise NotImplementedError(
+                    f"Separate-weight GMM: unsupported activation '{activation}'.")
+    else:
+        # GMM1 computes x @ (W_gate | W_up) together and activation.
+        # The GMM kernel requires local_N % (2 * num_lanes) == 0 when fuse_act is
+        # enabled (it splits N in half for gate/up).  When this condition is not met
+        # (e.g. moe_intermediate_size not divisible by num_lanes * TP), fall back to
+        # two separate GMMs with manual activation.  This avoids any weight padding
+        # (which increases HBM usage) or runtime concatenation (which creates large
+        # compile-time temp allocations).
+        _use_fused_act = False
+        if activation is not None:
+            fused_n = w1.shape[-1]  # = 2 * F_local
+            f_local = fused_n // 2
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            _use_fused_act = (f_local % num_lanes == 0)
+
+        if _use_fused_act:
+            gmm1_res = gmm_wrapper(
+                x,
+                w1,
+                w1_scale,
+                w1_bias,
+                group_sizes,
+                group_offset,
+                fuse_act=activation,
+                preferred_element_type=x.dtype,
+            )
+        else:
+            # Unfused path: run gate and up projections as separate GMMs, then
+            # apply the activation manually.  The slices are views (contiguous along
+            # the last axis), so no copy is needed.
+            if activation is not None:
+                gate_w = w1[..., :f_local]
+                up_w = w1[..., f_local:]
+            else:
+                gate_w = w1
+                up_w = None  # unused
+
+            gate_res = gmm_wrapper(
+                x,
+                gate_w,
+                None,  # scale not supported in unfused path; quantized models must
+                None,  # satisfy the constraint or use a different backend
+                group_sizes,
+                group_offset,
+                fuse_act=None,
+                preferred_element_type=x.dtype,
+            )
+            if activation is None:
+                gmm1_res = gate_res
+            else:
+                up_res = gmm_wrapper(
+                    x,
+                    up_w,
+                    None,
+                    None,
+                    group_sizes,
+                    group_offset,
+                    fuse_act=None,
+                    preferred_element_type=x.dtype,
+                )
+                match activation:
+                    case "silu":
+                        gmm1_res = jax.nn.silu(gate_res) * up_res
+                    case "gelu":
+                        gmm1_res = jax.nn.gelu(gate_res) * up_res
+                    case _:
+                        raise NotImplementedError(
+                            f"Unfused GMM activation fallback: unsupported activation '{activation}'. "
+                            "Pre-pad the fused weight to satisfy the 2*num_lanes constraint instead."
+                        )
 
     # When the parallelism is TP since w2_bias is not sharded, we should only apply bias
     # once, not applying to every shard. So we set w2_bias to 0 to all shards other than
@@ -196,6 +282,7 @@ def tensor_parallel_gmm(
     mesh: Mesh,
     sc_kernel_threshold: int,
     sc_kernel_col_chunk_size: int,
+    w1_up: jax.Array | None = None,
 ) -> jax.Array:
     data_p_spec = P(ShardingAxisName.MLP_DATA)
     group_offset = jnp.array([0])
@@ -203,15 +290,55 @@ def tensor_parallel_gmm(
     w1_spec = P(None, None, ShardingAxisName.MLP_TENSOR)
     w2_spec = P(None, ShardingAxisName.MLP_TENSOR, None)
 
-    w1_scale_spec = (None if w1_scale is None else P(
-        None, None, None, ShardingAxisName.MLP_TENSOR))
-    w1_bias_spec = (None if w1_bias is None else P(
-        None, None, ShardingAxisName.MLP_TENSOR))
-
     num_blocks = 1 if w2_scale is None else w2_scale.shape[1]
     w2_scale_spec = (None if num_blocks == 1 else P(
         None, ShardingAxisName.MLP_TENSOR, None, None))
     w2_bias_spec = None if w2_bias is None else P(None, None, None)
+
+    if w1_up is not None:
+        # Unfused path: w1=gate (E,D,F) and w1_up=up (E,D,F), both TP-sharded
+        # on the F axis.  Each chip gets (E, D, F/TP) for gate and up separately.
+        # No slicing inside shard_map → no HLO copy buffers.
+        def _local_unfused(x, w1_gate, w1_up_local, w2, w2_scale, w2_bias,
+                           group_sizes, group_offset,
+                           topk_argsort_revert_indices, topk_weights):
+            return moe_gmm_local(
+                x, w1_gate, None, None, w2, w2_scale, w2_bias,
+                group_sizes, group_offset,
+                topk_argsort_revert_indices, topk_weights,
+                activation=activation, topk=topk, parallelism="tp",
+                sc_kernel_threshold=sc_kernel_threshold,
+                sc_kernel_col_chunk_size=sc_kernel_col_chunk_size,
+                w1_up=w1_up_local,
+            )
+
+        return jax.shard_map(
+            _local_unfused,
+            mesh=mesh,
+            in_specs=(
+                data_p_spec,   # x
+                w1_spec,       # w1_gate
+                w1_spec,       # w1_up
+                w2_spec,       # w2
+                w2_scale_spec, # w2_scale
+                w2_bias_spec,  # w2_bias
+                data_p_spec,   # group_sizes
+                P(),           # group_offset
+                data_p_spec,   # topk_argsort_revert_indices
+                data_p_spec,   # topk_weights
+            ),
+            out_specs=(data_p_spec),
+            check_vma=False,
+        )(
+            x, w1, w1_up, w2, w2_scale, w2_bias,
+            group_sizes, group_offset,
+            topk_argsort_revert_indices, topk_weights,
+        )
+
+    w1_scale_spec = (None if w1_scale is None else P(
+        None, None, None, ShardingAxisName.MLP_TENSOR))
+    w1_bias_spec = (None if w1_bias is None else P(
+        None, None, ShardingAxisName.MLP_TENSOR))
 
     return jax.shard_map(
         functools.partial(
@@ -350,6 +477,7 @@ def fused_moe_func(
     scoring_fn: str,
     sc_kernel_threshold: int,
     sc_kernel_col_chunk_size: int,
+    w1_up: jax.Array | None = None,
 ) -> jax.Array:
     """Route tokens in hidden_states into each experts based on routing.
 
@@ -459,6 +587,7 @@ def fused_moe_func(
             mesh=mesh,
             sc_kernel_threshold=sc_kernel_threshold,
             sc_kernel_col_chunk_size=sc_kernel_col_chunk_size,
+            w1_up=w1_up,
         )
 
     return x[:num_tokens, :hidden_size]

@@ -24,7 +24,7 @@ import jax.numpy as jnp
 from flax import nnx
 from flax.typing import Sharding
 from jax import lax
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, get_mesh
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Float
 from vllm.config import VllmConfig
@@ -40,7 +40,8 @@ from tpu_inference.layers.common.quantization import (dequantize_tensor,
                                                       quantize_kv)
 from tpu_inference.layers.common.sharding import \
     ShardingAxisNameBase as ShardingAxisName
-from tpu_inference.layers.common.utils import cpu_mesh_context
+from tpu_inference.layers.common.utils import (cpu_mesh, cpu_mesh_context,
+                                                general_device_put)
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.attention.attention import AttentionMetadata
 from tpu_inference.layers.jax.base import _init_fn as init_fn
@@ -568,13 +569,24 @@ class MLAEinsum(JaxEinsum):
                 prefix=mla_layer.prefix + ".v_up_proj",
                 quant_config=self.quant_config,
             ))
+        # In multi-host (ray) mode, CPU JAX arrays from cpu_mesh_context()
+        # may lack a recognizable source_mesh for shard_put, causing
+        # general_device_put to fail when slicing on TPU context.
+        # Fix: pass source_mesh=cpu_mesh() explicitly so general_device_put
+        # slices in the correct (CPU) context. This preserves FP8 dtypes
+        # which np.array() would silently corrupt.
+        _mesh = get_mesh()
+        _anh = self.mla_layer.anh_sharding
+        _cpu = cpu_mesh()
         # Cannot apply anh_sharding to scales, otherwise it complains about shape mismatch.
-        mla_layer.k_up_proj.weight.value = shard_put(
-            k_ANH_weight, self.mla_layer.anh_sharding)
-        mla_layer.k_up_proj.weight_scale_inv.value = shard_put(k_N1A_scale, ())
-        mla_layer.v_up_proj.weight.value = shard_put(
-            v_ANH_weight, self.mla_layer.anh_sharding)
-        mla_layer.v_up_proj.weight_scale_inv.value = shard_put(v_N1H_scale, ())
+        mla_layer.k_up_proj.weight.value = general_device_put(
+            k_ANH_weight, NamedSharding(_mesh, P(*_anh)), source_mesh=_cpu)
+        mla_layer.k_up_proj.weight_scale_inv.value = general_device_put(
+            k_N1A_scale, NamedSharding(_mesh, P()), source_mesh=_cpu)
+        mla_layer.v_up_proj.weight.value = general_device_put(
+            v_ANH_weight, NamedSharding(_mesh, P(*_anh)), source_mesh=_cpu)
+        mla_layer.v_up_proj.weight_scale_inv.value = general_device_put(
+            v_N1H_scale, NamedSharding(_mesh, P()), source_mesh=_cpu)
 
         delattr(self, 'weight')
         delattr(self, 'weight_scale_inv')
@@ -815,6 +827,54 @@ class SharedFusedMoe(JaxMoE):
     shared_experts: Optional[DeepseekV3MLP] = None
 
     routed_scaling_factor: float = 1.0
+
+    def load_weights(self, weights):
+        """Load weights, handling shared_experts.* that arrive under the experts.* prefix.
+
+        In some checkpoints (e.g. GLM-4.5-Air) the shared expert weights are stored
+        under the same "experts.*" namespace as the routed expert weights.  The base
+        JaxMoE._load_weights only handles numeric expert IDs, so we peel off the
+        "shared_experts.*" entries here and dispatch them via the param's weight_loader
+        (set up by JaxAutoWeightsLoader.__init__).
+        """
+        if self.shared_experts is None:
+            return super().load_weights(weights)
+
+        SHARED_PREFIX = "shared_experts."
+        shared_expert_weights = []
+        routed_expert_weights = []
+        for name, tensor in weights:
+            if name.startswith(SHARED_PREFIX):
+                shared_expert_weights.append(
+                    (name[len(SHARED_PREFIX):], tensor))
+            else:
+                routed_expert_weights.append((name, tensor))
+
+        # Load routed expert weights via the standard JaxMoE path.
+        loaded = super().load_weights(routed_expert_weights)
+
+        # Load shared expert weights (e.g. "gate_proj.weight") via weight_loader.
+        for name, tensor in shared_expert_weights:
+            parts = name.split(".")  # ["gate_proj", "weight"]
+            if len(parts) < 2:
+                continue
+            submod = getattr(self.shared_experts, parts[0], None)
+            param = getattr(submod, parts[1], None) if submod is not None else None
+            if not isinstance(param, nnx.Param):
+                logger.warning(
+                    "SharedFusedMoe: could not find param for shared_experts.%s",
+                    name)
+                continue
+            weight_loader = param.get_metadata().get("weight_loader")
+            if weight_loader is None:
+                logger.warning(
+                    "SharedFusedMoe: no weight_loader for shared_experts.%s",
+                    name)
+                continue
+            weight_loader(param, tensor)
+            loaded.add(f"shared_experts.{name}")
+
+        return loaded
 
     def __call__(self, x_TD: jax.Array) -> jax.Array:
         # Compute Routed Experts

@@ -121,8 +121,16 @@ def create_kv_caches(
                                                cache_dtype, use_mla)
 
     if use_mla:
-        sharding = NamedSharding(mesh,
-                                 PartitionSpec(ShardingAxisName.MLP_TENSOR))
+        # On 2D mesh (no 'attn_dp' axis), MLA cache must be replicated so
+        # every TP device sees all KV pages during attention.  On 5D mesh
+        # (DS-V3 style dp-attention), the existing page-sharded layout is
+        # correct because each device is an independent DP group.
+        is_2d_mesh = 'attn_dp' not in mesh.axis_names
+        if is_2d_mesh:
+            sharding = NamedSharding(mesh, PartitionSpec())
+        else:
+            sharding = NamedSharding(
+                mesh, PartitionSpec(ShardingAxisName.MLP_TENSOR))
     else:
         sharding = NamedSharding(
             mesh,

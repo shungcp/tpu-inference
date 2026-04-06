@@ -77,6 +77,7 @@ def moe_apply(
     moe_backend: MoEBackend,
     mesh: Mesh,
     extra_backend_kwargs: dict,
+    w1_up: jax.Array | None = None,
 ) -> jax.Array:
 
     with jax.named_scope(layer._get_name()):
@@ -139,6 +140,7 @@ def moe_apply(
                     scoring_fn=layer.scoring_func,
                     sc_kernel_threshold=envs.SC_KERNEL_THRESHOLD,
                     sc_kernel_col_chunk_size=envs.SC_KERNEL_COL_CHUNK_SIZE,
+                    w1_up=w1_up,
                 )
             case MoEBackend.DENSE_MAT:
                 # NOTE: circular import avoidance

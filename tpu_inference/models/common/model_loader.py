@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 from typing import Any, Optional
 
 import jax
@@ -40,6 +41,37 @@ from tpu_inference.models.jax.utils.weight_utils import (BaseWeightLoader,
 from tpu_inference.utils import to_jax_dtype, to_torch_dtype
 
 logger = init_logger(__name__)
+
+# ---- Weight cache: skip safetensors on repeated runs ----
+_WEIGHT_CACHE_DIR = os.environ.get('JAX_WEIGHT_CACHE_DIR', '')
+
+
+def _weight_cache_exists(cache_dir: str) -> bool:
+    """Check if a valid orbax checkpoint exists."""
+    if not cache_dir:
+        return False
+    # orbax creates a metadata file inside the directory
+    return os.path.isdir(cache_dir) and any(
+        f for f in os.listdir(cache_dir) if not f.startswith('.'))
+
+
+def _save_weight_cache(model: nnx.Module, cache_dir: str):
+    """Save model weights to orbax checkpoint (tensorstore backend)."""
+    import orbax.checkpoint as ocp
+    state = nnx.state(model)
+    checkpointer = ocp.PyTreeCheckpointer()
+    checkpointer.save(cache_dir, state)
+    logger.info("Weight cache saved to %s", cache_dir)
+
+
+def _restore_weight_cache(model: nnx.Module, cache_dir: str):
+    """Restore model weights from orbax checkpoint."""
+    import orbax.checkpoint as ocp
+    abstract_state = nnx.state(model)
+    checkpointer = ocp.PyTreeCheckpointer()
+    restored = checkpointer.restore(cache_dir, item=abstract_state)
+    nnx.update(model, restored)
+    logger.info("Weight cache restored from %s", cache_dir)
 
 _MODEL_REGISTRY = {}
 
@@ -228,28 +260,35 @@ def _get_nnx_model(
         # the model creation again, otherwise the model forward will have
         # non-trivial overhead in PjitFunction.
         with jax.set_mesh(mesh):
-            if vllm_config.load_config.load_format == "dummy":
-                vllm_config.load_config.load_format = "jax_dummy"
-            loader = get_model_loader(vllm_config.load_config)
-            if isinstance(model, LoadableWithIterator):
-                assert isinstance(model, JaxModule)
-                loader.load_weights(model, vllm_config.model_config)
-            elif isinstance(loader, RunaiModelStreamerLoader):
-                model_weights = vllm_config.model_config.model
-                if hasattr(vllm_config.model_config, "model_weights"):
-                    model_weights = vllm_config.model_config.model_weights
-                weights_iterator = loader._get_weights_iterator(
-                    model_weights, vllm_config.model_config.revision)
-                # We set the weights iterator at runtime, to prevent having to change
-                # every model's load_weights signature. This also prevents us from hitting
-                # a TypeError at runtime if you use the RunaiModelStreamerLoader with any
-                # flax_nnx model whose load_weights function does not accept the
-                # weights_iterator keyword argument.
-                vllm_config.model_config.runai_model_weights_iterator = weights_iterator
-                model.load_weights(rng)
-                del vllm_config.model_config.runai_model_weights_iterator
+            if _weight_cache_exists(_WEIGHT_CACHE_DIR):
+                # Fast path: restore from cached checkpoint
+                logger.info("Restoring weights from cache: %s",
+                            _WEIGHT_CACHE_DIR)
+                _restore_weight_cache(model, _WEIGHT_CACHE_DIR)
             else:
-                model.load_weights(rng)
+                # Normal path: load from safetensors / HF
+                if vllm_config.load_config.load_format == "dummy":
+                    vllm_config.load_config.load_format = "jax_dummy"
+                loader = get_model_loader(vllm_config.load_config)
+                if isinstance(model, LoadableWithIterator):
+                    assert isinstance(model, JaxModule)
+                    loader.load_weights(model, vllm_config.model_config)
+                elif isinstance(loader, RunaiModelStreamerLoader):
+                    model_weights = vllm_config.model_config.model
+                    if hasattr(vllm_config.model_config, "model_weights"):
+                        model_weights = vllm_config.model_config.model_weights
+                    weights_iterator = loader._get_weights_iterator(
+                        model_weights, vllm_config.model_config.revision)
+                    vllm_config.model_config.runai_model_weights_iterator = weights_iterator
+                    model.load_weights(rng)
+                    del vllm_config.model_config.runai_model_weights_iterator
+                else:
+                    model.load_weights(rng)
+                # Save cache for next run
+                if _WEIGHT_CACHE_DIR:
+                    logger.info("Saving weight cache to: %s",
+                                _WEIGHT_CACHE_DIR)
+                    _save_weight_cache(model, _WEIGHT_CACHE_DIR)
             jit_model = create_jit_model(
                 model,
                 use_qwix_on_abstract_model=should_apply_qwix_on_abstract_model)
@@ -282,10 +321,21 @@ def get_flax_model(
         model_class = _get_model_architecture(
             vllm_config.model_config.hf_config)
     jit_model = _get_nnx_model(model_class, vllm_config, rng, mesh)
-    kv_cache_sharding = NamedSharding(
-        mesh,
-        PartitionSpec(ShardingAxisName.ATTN_DATA, None,
-                      ShardingAxisName.ATTN_HEAD))
+    if vllm_config.model_config.use_mla:
+        # On 2D mesh (pure TP, no dp-attention), MLA cache is replicated so
+        # every device sees all KV pages.  On 5D mesh the page-sharded layout
+        # is correct.
+        is_2d_mesh = 'attn_dp' not in mesh.axis_names
+        if is_2d_mesh:
+            kv_cache_sharding = NamedSharding(mesh, PartitionSpec())
+        else:
+            kv_cache_sharding = NamedSharding(
+                mesh, PartitionSpec(ShardingAxisName.MLP_TENSOR))
+    else:
+        kv_cache_sharding = NamedSharding(
+            mesh,
+            PartitionSpec(ShardingAxisName.ATTN_DATA, None,
+                          ShardingAxisName.ATTN_HEAD))
     hidden_states_sharding = NamedSharding(mesh,
                                            PartitionSpec(
                                                ShardingAxisName.ATTN_DATA,

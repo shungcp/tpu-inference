@@ -31,7 +31,7 @@ from tpu_inference.layers.jax.quantization import QuantizeMethodBase
 from tpu_inference.layers.jax.quantization.configs import QuantizationConfig
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.utils.weight_utils import (
-    jax_array_from_reshaped_torch, shard_put)
+    assign_and_shard_param, jax_array_from_reshaped_torch)
 
 modeling_flax_utils = FlaxUtils()
 logger = init_logger(__name__)
@@ -286,31 +286,86 @@ class JaxMoE(JaxModule):
 
             assert isinstance(jax_param, nnx.Param)
 
+            # HF stores linear weights as (out_features, in_features):
+            #   gate/up: (F, D) → reshape to (1, F, D)
+            #   down:    (D, F) → reshape to (1, D, F)
+            # No permute here; for fused backends, process_weights_after_loading
+            # fuses gate+up on CPU. For down, (E, D, F) is stored so that
+            # swapaxes(1, 2) in the forward pass yields (E, F, D) for GMM2.
             jax_weight = jax_array_from_reshaped_torch(
-                torch_weight, reshape_dims=(1, ) +
-                torch_weight.shape)  # add expert dim for concatenation later
+                torch_weight,
+                reshape_dims=(1,) + torch_weight.shape)
             jax_param._weights_to_load[expert_id] = jax_weight
 
         logger.debug(f"Loaded {cnt} weights for {self.prefix} MoE layer.")
 
         loaded_names = set()
-        # This function could be called more than once, if the weights for moe layer is spread
-        # across multiple safetensor files. Here we use counter to track the completion of weight loading, and only perform the fusion and sharding after all weights are loaded.
-        for param_name, param in {
+        is_fused_backend = self.moe_backend in MoEBackend.fused_moe_backends()
+
+        # For fused backends (GMM_TP/EP): gate+up fusion is deferred to
+        # process_weights_after_loading which operates on CPU _weights_to_load
+        # arrays directly to avoid OOM from sharding-before-fusion.
+        # Only assign down_proj here (all three for non-fused backends).
+        params_to_assign = {"kernel_down_proj_EFD": self.kernel_down_proj_EFD}
+        if not is_fused_backend:
+            params_to_assign.update({
                 "kernel_gating_EDF": self.kernel_gating_EDF,
                 "kernel_up_proj_EDF": self.kernel_up_proj_EDF,
-                "kernel_down_proj_EFD": self.kernel_down_proj_EFD
-        }.items():
+            })
+
+        # This function could be called more than once, if the weights for moe layer is spread
+        # across multiple safetensor files (or when checkpoint ordering causes the same module
+        # to be visited via multiple non-consecutive groupby groups).  Skip params that were
+        # already sharded in a previous call (marked by _is_loaded).
+        for param_name, param in params_to_assign.items():
+            if '_weights_to_load' not in param.get_metadata():
+                # Param was replaced (e.g. by process_weights_after_loading
+                # adding layout); treat as already loaded.
+                loaded_names.add(param_name)
+                continue
             weights_to_load = param._weights_to_load
             if all(w is not None for w in weights_to_load):
+                if param.get_metadata().get("_is_loaded", False):
+                    # Already assigned in a prior _load_weights call; just report as loaded.
+                    loaded_names.add(param_name)
+                    continue
                 with cpu_mesh_context():
                     weights = jnp.concatenate(param._weights_to_load, axis=0)
                 try:
-                    param.value = shard_put(weights, param.sharding)
+                    assign_and_shard_param(param, weights, param_name,
+                                           mesh=self.mesh)
                     loaded_names.add(param_name)
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to load weights for {param_name} with {weights.shape=} {param.value.shape=}"
                     ) from e
+
+        # For fused backends, report gate/up as loaded once _weights_to_load is
+        # fully populated; the actual fusion/sharding happens in process_weights_after_loading.
+        # Guard: kernel_gating_EDF / kernel_up_proj_EDF may be deleted (GMM_EP) or
+        # replaced with new Params without _weights_to_load (GMM_TP unfused) by
+        # process_weights_after_loading.  When _load_weights is called a second time
+        # (e.g. non-consecutive checkpoint shard ordering), detect the post-processed
+        # state and just report loaded.
+        if is_fused_backend:
+            if hasattr(self, 'kernel_gating_EDF') and hasattr(self, 'kernel_up_proj_EDF'):
+                gate_param = self.kernel_gating_EDF
+                up_param = self.kernel_up_proj_EDF
+                gate_has_wtl = '_weights_to_load' in gate_param.get_metadata()
+                up_has_wtl = '_weights_to_load' in up_param.get_metadata()
+                if gate_has_wtl and up_has_wtl:
+                    for name, param in [("kernel_gating_EDF", gate_param),
+                                         ("kernel_up_proj_EDF", up_param)]:
+                        if all(w is not None for w in param._weights_to_load):
+                            loaded_names.add(name)
+                else:
+                    # Already processed by process_weights_after_loading
+                    # (GMM_TP unfused path: replaced with pre-transposed Params).
+                    loaded_names.add("kernel_gating_EDF")
+                    loaded_names.add("kernel_up_proj_EDF")
+            elif hasattr(self, 'kernel_gating_upproj_EDF'):
+                # Already fused by a prior process_weights_after_loading call.
+                loaded_names.add("kernel_gating_EDF")
+                loaded_names.add("kernel_up_proj_EDF")
 
         return loaded_names

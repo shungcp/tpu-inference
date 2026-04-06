@@ -397,6 +397,18 @@ class KVCacheManager:
                 dp_size = self.runner.vllm_config.sharding_config.total_dp_size
                 # num_blocks must be a multiple of dp_size
                 num_blocks = (num_blocks // dp_size) * dp_size
+                # For MLA on 2D mesh the cache is replicated (each device
+                # holds ALL blocks), so divide the budget by model_size.
+                # On 5D mesh the cache is page-sharded; just align.
+                if self.use_mla:
+                    from tpu_inference.layers.common.sharding import ShardingAxisName
+                    model_size = utils.get_mesh_shape_product(
+                        self.runner.mesh, ShardingAxisName.MLP_TENSOR)
+                    is_2d_mesh = 'attn_dp' not in self.runner.mesh.axis_names
+                    if is_2d_mesh and model_size > 1:
+                        num_blocks = num_blocks // model_size
+                    elif model_size > 1:
+                        num_blocks = (num_blocks // model_size) * model_size
 
                 if isinstance(layer_spec, MambaSpec):
                     mamba_states = []

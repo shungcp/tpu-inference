@@ -251,9 +251,9 @@ def get_expert_parallelism(expert_axis_name: str, mesh: Mesh) -> int:
         return 1
     else:
         if isinstance(expert_axis_name, str):
-            return mesh.shape[expert_axis_name]
+            return mesh.shape.get(expert_axis_name, 1)
         else:
-            return math.prod(mesh.shape[axis] for axis in expert_axis_name)
+            return math.prod(mesh.shape.get(axis, 1) for axis in expert_axis_name)
 
 
 def select_moe_backend(use_ep: bool) -> MoEBackend:

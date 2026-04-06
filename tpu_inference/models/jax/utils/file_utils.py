@@ -93,6 +93,7 @@ def get_hf_model_weights_size(repo_id: str, weights_format: str) -> int:
 class DisabledTqdm(tqdm):
 
     def __init__(self, *args, **kwargs):
+        kwargs.pop("disable", None)
         super().__init__(*args, **kwargs, disable=True)
 
 
