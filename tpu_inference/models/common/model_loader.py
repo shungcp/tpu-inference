@@ -43,35 +43,86 @@ from tpu_inference.utils import to_jax_dtype, to_torch_dtype
 logger = init_logger(__name__)
 
 # ---- Weight cache: skip safetensors on repeated runs ----
+# Each process saves its own device shards independently (no cross-host
+# coordination), so this works with Ray multi-host setups.
 _WEIGHT_CACHE_DIR = os.environ.get('JAX_WEIGHT_CACHE_DIR', '')
 
 
 def _weight_cache_exists(cache_dir: str) -> bool:
-    """Check if a valid orbax checkpoint exists."""
     if not cache_dir:
         return False
-    # orbax creates a metadata file inside the directory
-    return os.path.isdir(cache_dir) and any(
-        f for f in os.listdir(cache_dir) if not f.startswith('.'))
+    proc_dir = os.path.join(cache_dir, f"proc_{jax.process_index()}")
+    return os.path.isfile(os.path.join(proc_dir, "meta.pkl"))
 
 
-def _save_weight_cache(model: nnx.Module, cache_dir: str):
-    """Save model weights to orbax checkpoint (tensorstore backend)."""
-    import orbax.checkpoint as ocp
-    state = nnx.state(model)
-    checkpointer = ocp.PyTreeCheckpointer()
-    checkpointer.save(cache_dir, state)
-    logger.info("Weight cache saved to %s", cache_dir)
+def _save_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
+    """Save model weights per-process using numpy files."""
+    import pickle
+    import numpy as np
+
+    proc_idx = jax.process_index()
+    proc_dir = os.path.join(cache_dir, f"proc_{proc_idx}")
+    os.makedirs(proc_dir, exist_ok=True)
+
+    _, state = nnx.split(model)
+    flat, treedef = jax.tree.flatten(state)
+
+    meta_entries = []
+    array_count = 0
+    for i, leaf in enumerate(flat):
+        if isinstance(leaf, jax.Array):
+            shard_dict = {}
+            for s in leaf.addressable_shards:
+                shard_dict[f"d{s.device.id}"] = np.array(s.data)
+            np.savez(os.path.join(proc_dir, f"a{i}.npz"), **shard_dict)
+            meta_entries.append(
+                ('array', i, leaf.shape, str(leaf.dtype),
+                 leaf.sharding.spec if hasattr(leaf.sharding, 'spec') else None))
+            array_count += 1
+        else:
+            meta_entries.append(('other', i, leaf))
+
+    with open(os.path.join(proc_dir, "meta.pkl"), "wb") as f:
+        pickle.dump({'treedef': treedef, 'entries': meta_entries}, f,
+                    protocol=pickle.HIGHEST_PROTOCOL)
+    logger.info("Weight cache saved: %s (process %d, %d arrays)",
+                proc_dir, proc_idx, array_count)
 
 
-def _restore_weight_cache(model: nnx.Module, cache_dir: str):
-    """Restore model weights from orbax checkpoint."""
-    import orbax.checkpoint as ocp
-    abstract_state = nnx.state(model)
-    checkpointer = ocp.PyTreeCheckpointer()
-    restored = checkpointer.restore(cache_dir, item=abstract_state)
-    nnx.update(model, restored)
-    logger.info("Weight cache restored from %s", cache_dir)
+def _restore_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
+    """Restore model weights per-process from numpy files."""
+    import pickle
+    import numpy as np
+
+    proc_idx = jax.process_index()
+    proc_dir = os.path.join(cache_dir, f"proc_{proc_idx}")
+
+    with open(os.path.join(proc_dir, "meta.pkl"), "rb") as f:
+        saved = pickle.load(f)
+
+    local_devices = {d.id: d for d in jax.local_devices()}
+    flat = [None] * len(saved['entries'])
+
+    for entry in saved['entries']:
+        if entry[0] == 'array':
+            _, idx, shape, dtype_str, pspec = entry
+            data = dict(np.load(os.path.join(proc_dir, f"a{idx}.npz")))
+            sharding = NamedSharding(mesh, pspec) if pspec is not None \
+                else NamedSharding(mesh, PartitionSpec())
+            per_device = []
+            for dev_id in sorted(local_devices.keys()):
+                per_device.append(
+                    jax.device_put(data[f"d{dev_id}"], local_devices[dev_id]))
+            arr = jax.make_array_from_single_device_arrays(
+                shape, sharding, per_device)
+            flat[idx] = arr
+        else:
+            _, idx, value = entry
+            flat[idx] = value
+
+    state = saved['treedef'].unflatten(flat)
+    nnx.update(model, state)
+    logger.info("Weight cache restored: %s (process %d)", proc_dir, proc_idx)
 
 _MODEL_REGISTRY = {}
 
@@ -264,7 +315,7 @@ def _get_nnx_model(
                 # Fast path: restore from cached checkpoint
                 logger.info("Restoring weights from cache: %s",
                             _WEIGHT_CACHE_DIR)
-                _restore_weight_cache(model, _WEIGHT_CACHE_DIR)
+                _restore_weight_cache(model, _WEIGHT_CACHE_DIR, mesh)
             else:
                 # Normal path: load from safetensors / HF
                 if vllm_config.load_config.load_format == "dummy":
@@ -288,7 +339,7 @@ def _get_nnx_model(
                 if _WEIGHT_CACHE_DIR:
                     logger.info("Saving weight cache to: %s",
                                 _WEIGHT_CACHE_DIR)
-                    _save_weight_cache(model, _WEIGHT_CACHE_DIR)
+                    _save_weight_cache(model, _WEIGHT_CACHE_DIR, mesh)
             jit_model = create_jit_model(
                 model,
                 use_qwix_on_abstract_model=should_apply_qwix_on_abstract_model)
