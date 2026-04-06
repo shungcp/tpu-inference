@@ -52,15 +52,34 @@ def _weight_cache_exists(cache_dir: str) -> bool:
     if not cache_dir:
         return False
     proc_dir = os.path.join(cache_dir, f"proc_{jax.process_index()}")
-    return os.path.isfile(os.path.join(proc_dir, "meta.json"))
+    meta_path = os.path.join(proc_dir, "meta.json")
+    if not os.path.isfile(meta_path):
+        return False
+    # Only accept version 2 (path-based) format
+    import json
+    with open(meta_path) as f:
+        meta = json.load(f)
+    return meta.get('version') == 2
+
+
+def _path_to_str(path):
+    """Convert a JAX key path to a dot-separated string."""
+    parts = []
+    for k in path:
+        if hasattr(k, 'key'):
+            parts.append(str(k.key))
+        elif hasattr(k, 'idx'):
+            parts.append(str(k.idx))
+        else:
+            parts.append(str(k))
+    return '.'.join(parts)
 
 
 def _save_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
-    """Save model weights per-process using numpy files.
+    """Save model weights per-process, keyed by parameter path.
 
-    Only JAX arrays are saved.  The tree structure and non-array metadata
-    (variable types, initializers, partition specs) are NOT pickled — they
-    are reconstructed from the abstract model on restore.
+    Uses parameter paths (e.g. 'model.layers.0.self_attn.k_up_proj.weight')
+    as keys, not tree indices. This is robust against tree structure changes.
     """
     import json
     import numpy as np
@@ -70,45 +89,39 @@ def _save_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
     os.makedirs(proc_dir, exist_ok=True)
 
     _, state = nnx.split(model)
-    flat = jax.tree.leaves(state)
+    leaves_with_paths, _ = jax.tree_util.tree_flatten_with_path(state)
 
-    # Identify which leaves are JAX arrays and save them
-    array_indices = []
-    array_dtypes = {}   # str(idx) -> dtype string
-    array_shapes = {}   # str(idx) -> global shape list
-    array_specs = {}    # str(idx) -> PartitionSpec as list (actual runtime spec)
-    for i, leaf in enumerate(flat):
-        if isinstance(leaf, jax.Array):
-            shard_dict = {}
-            for s in leaf.addressable_shards:
-                shard_dict[f"d{s.device.id}"] = np.array(s.data)
-            np.savez(os.path.join(proc_dir, f"a{i}.npz"), **shard_dict)
-            array_indices.append(i)
-            array_dtypes[str(i)] = str(leaf.dtype)
-            array_shapes[str(i)] = list(leaf.shape)
-            if hasattr(leaf.sharding, 'spec'):
-                array_specs[str(i)] = list(leaf.sharding.spec)
-            else:
-                array_specs[str(i)] = None
+    params = {}  # path_str -> {dtype, shape, spec, file}
+    for path, leaf in leaves_with_paths:
+        if not isinstance(leaf, jax.Array):
+            continue
+        path_str = _path_to_str(path)
+        # Save shards as npz
+        shard_dict = {}
+        for s in leaf.addressable_shards:
+            shard_dict[f"d{s.device.id}"] = np.array(s.data)
+        fname = path_str.replace('.', '_') + '.npz'
+        np.savez(os.path.join(proc_dir, fname), **shard_dict)
+        spec = list(leaf.sharding.spec) if hasattr(leaf.sharding, 'spec') \
+            else None
+        params[path_str] = {
+            'dtype': str(leaf.dtype),
+            'shape': list(leaf.shape),
+            'spec': spec,
+            'file': fname,
+        }
 
-    # Save array index list + dtypes + shapes + specs
     with open(os.path.join(proc_dir, "meta.json"), "w") as f:
-        json.dump({'array_indices': array_indices, 'num_leaves': len(flat),
-                   'array_dtypes': array_dtypes, 'array_shapes': array_shapes,
-                   'array_specs': array_specs}, f)
-    logger.info("Weight cache saved: %s (process %d, %d arrays)",
-                proc_dir, proc_idx, len(array_indices))
+        json.dump({'version': 2, 'params': params}, f)
+    logger.info("Weight cache saved: %s (process %d, %d params)",
+                proc_dir, proc_idx, len(params))
 
 
 def _restore_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
-    """Restore model weights per-process from numpy files.
-
-    The tree structure comes from the abstract *model* (already created via
-    ``nnx.eval_shape``).  We only replace the JAX-array leaves with data
-    loaded from cache.
-    """
+    """Restore model weights per-process, matching by parameter path."""
     import json
     import numpy as np
+    import jax.numpy as jnp
 
     proc_idx = jax.process_index()
     proc_dir = os.path.join(cache_dir, f"proc_{proc_idx}")
@@ -116,55 +129,47 @@ def _restore_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
     with open(os.path.join(proc_dir, "meta.json")) as f:
         meta = json.load(f)
 
-    # Get the abstract model's state — this provides treedef + non-array leaves
-    _, abstract_state = nnx.split(model)
-    flat_abstract = jax.tree.leaves(abstract_state)
-
+    params = meta['params']
     local_devices = {d.id: d for d in jax.local_devices()}
-    array_set = set(meta['array_indices'])
 
-    # Build replacement map: leaf index → loaded JAX array
-    import jax.numpy as jnp
-    array_dtypes = meta.get('array_dtypes', {})
-    array_shapes = meta.get('array_shapes', {})
-    array_specs = meta.get('array_specs', {})
-    replacements = {}
-    for idx in meta['array_indices']:
-        data = dict(np.load(os.path.join(proc_dir, f"a{idx}.npz")))
-        # Use saved shape and sharding spec (not abstract model's, which may differ)
-        idx_str = str(idx)
-        if idx_str in array_shapes:
-            shape = tuple(array_shapes[idx_str])
-        else:
-            shape = flat_abstract[idx].shape
-        if idx_str in array_specs and array_specs[idx_str] is not None:
-            sharding = NamedSharding(mesh, PartitionSpec(*array_specs[idx_str]))
+    # Get current model state with paths
+    _, state = nnx.split(model)
+    leaves_with_paths, treedef = jax.tree_util.tree_flatten_with_path(state)
+
+    # Build path → loaded array mapping
+    loaded_arrays = {}
+    for path_str, info in params.items():
+        data = dict(np.load(os.path.join(proc_dir, info['file'])))
+        shape = tuple(info['shape'])
+        if info['spec'] is not None:
+            sharding = NamedSharding(mesh, PartitionSpec(*info['spec']))
         else:
             sharding = NamedSharding(mesh, PartitionSpec())
-        # Restore original dtype (npz loses custom dtypes like bfloat16/float8)
-        orig_dtype_str = array_dtypes.get(idx_str)
-        orig_dtype = jnp.dtype(orig_dtype_str) if orig_dtype_str else None
+        orig_dtype = jnp.dtype(info['dtype'])
         per_device = []
         for dev_id in sorted(local_devices.keys()):
             arr = data[f"d{dev_id}"]
-            if orig_dtype is not None and arr.dtype != orig_dtype:
+            if arr.dtype != orig_dtype:
                 arr = arr.view(orig_dtype)
             per_device.append(jax.device_put(arr, local_devices[dev_id]))
-        replacements[idx] = jax.make_array_from_single_device_arrays(
+        loaded_arrays[path_str] = jax.make_array_from_single_device_arrays(
             shape, sharding, per_device)
 
-    # Replace array leaves in the abstract state
-    leaf_counter = [0]
+    # Replace matching leaves
+    new_leaves = []
+    matched = 0
+    for path, leaf in leaves_with_paths:
+        path_str = _path_to_str(path)
+        if path_str in loaded_arrays:
+            new_leaves.append(loaded_arrays[path_str])
+            matched += 1
+        else:
+            new_leaves.append(leaf)
 
-    def _replace(leaf):
-        i = leaf_counter[0]
-        leaf_counter[0] += 1
-        return replacements[i] if i in replacements else leaf
-
-    restored_state = jax.tree.map(_replace, abstract_state)
+    restored_state = treedef.unflatten(new_leaves)
     nnx.update(model, restored_state)
-    logger.info("Weight cache restored: %s (process %d, %d arrays)",
-                proc_dir, proc_idx, len(replacements))
+    logger.info("Weight cache restored: %s (process %d, %d/%d params matched)",
+                proc_dir, proc_idx, matched, len(params))
 
 _MODEL_REGISTRY = {}
 
