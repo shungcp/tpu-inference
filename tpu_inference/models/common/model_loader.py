@@ -62,24 +62,11 @@ def _weight_cache_exists(cache_dir: str) -> bool:
     return meta.get('version') == 2
 
 
-def _path_to_str(path):
-    """Convert a JAX key path to a dot-separated string."""
-    parts = []
-    for k in path:
-        if hasattr(k, 'key'):
-            parts.append(str(k.key))
-        elif hasattr(k, 'idx'):
-            parts.append(str(k.idx))
-        else:
-            parts.append(str(k))
-    return '.'.join(parts)
-
-
 def _save_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
     """Save model weights per-process, keyed by parameter path.
 
-    Uses parameter paths (e.g. 'model.layers.0.self_attn.k_up_proj.weight')
-    as keys, not tree indices. This is robust against tree structure changes.
+    Uses nnx.State.flat_state() which gives canonical tuple paths like
+    ('model', 'layers', '0', 'self_attn', 'weight'), joined with dots.
     """
     import json
     import numpy as np
@@ -89,14 +76,14 @@ def _save_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
     os.makedirs(proc_dir, exist_ok=True)
 
     _, state = nnx.split(model)
-    leaves_with_paths, _ = jax.tree_util.tree_flatten_with_path(state)
+    flat = state.flat_state()
 
     params = {}  # path_str -> {dtype, shape, spec, file}
-    for path, leaf in leaves_with_paths:
+    for path_tuple, var in flat:
+        leaf = var[...]
         if not isinstance(leaf, jax.Array):
             continue
-        path_str = _path_to_str(path)
-        # Save shards as npz
+        path_str = '.'.join(str(p) for p in path_tuple)
         shard_dict = {}
         for s in leaf.addressable_shards:
             shard_dict[f"d{s.device.id}"] = np.array(s.data)
@@ -118,7 +105,11 @@ def _save_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
 
 
 def _restore_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
-    """Restore model weights per-process, matching by parameter path."""
+    """Restore model weights per-process, matching by parameter path.
+
+    Uses nnx.State.flat_state() for canonical path matching, then navigates
+    the nested State dict to replace matched values in-place.
+    """
     import json
     import numpy as np
     import jax.numpy as jnp
@@ -132,11 +123,7 @@ def _restore_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
     params = meta['params']
     local_devices = {d.id: d for d in jax.local_devices()}
 
-    # Get current model state with paths
-    _, state = nnx.split(model)
-    leaves_with_paths, treedef = jax.tree_util.tree_flatten_with_path(state)
-
-    # Build path → loaded array mapping
+    # Load all cached arrays
     loaded_arrays = {}
     for path_str, info in params.items():
         data = dict(np.load(os.path.join(proc_dir, info['file'])))
@@ -155,19 +142,37 @@ def _restore_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
         loaded_arrays[path_str] = jax.make_array_from_single_device_arrays(
             shape, sharding, per_device)
 
-    # Replace matching leaves
-    new_leaves = []
+    # Get current model state and match by canonical path
+    _, state = nnx.split(model)
+    flat = state.flat_state()
+
     matched = 0
-    for path, leaf in leaves_with_paths:
-        path_str = _path_to_str(path)
+    model_paths = set()
+    unmatched_model = []
+    for path_tuple, var in flat:
+        path_str = '.'.join(str(p) for p in path_tuple)
+        model_paths.add(path_str)
         if path_str in loaded_arrays:
-            new_leaves.append(loaded_arrays[path_str])
+            # Navigate the nested state dict and replace
+            node = state
+            for key in path_tuple[:-1]:
+                node = node[key]
+            node[path_tuple[-1]] = type(var)(loaded_arrays[path_str])
             matched += 1
         else:
-            new_leaves.append(leaf)
+            unmatched_model.append(path_str)
 
-    restored_state = treedef.unflatten(new_leaves)
-    nnx.update(model, restored_state)
+    # Log diagnostic info
+    cache_paths = set(params.keys())
+    only_in_cache = cache_paths - model_paths
+    if only_in_cache:
+        logger.warning("Paths in cache but NOT in model (%d): %s",
+                       len(only_in_cache), sorted(only_in_cache)[:10])
+    if unmatched_model:
+        logger.warning("Paths in model but NOT in cache (%d): %s",
+                       len(unmatched_model), sorted(unmatched_model)[:10])
+
+    nnx.update(model, state)
     logger.info("Weight cache restored: %s (process %d, %d/%d params matched)",
                 proc_dir, proc_idx, matched, len(params))
 
