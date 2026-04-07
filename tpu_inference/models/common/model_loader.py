@@ -55,11 +55,11 @@ def _weight_cache_exists(cache_dir: str) -> bool:
     meta_path = os.path.join(proc_dir, "meta.json")
     if not os.path.isfile(meta_path):
         return False
-    # Only accept version 2 (path-based) format
+    # Only accept version 3 (flat_state path-based) format
     import json
     with open(meta_path) as f:
         meta = json.load(f)
-    return meta.get('version') == 2
+    return meta.get('version') == 3
 
 
 def _save_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
@@ -99,16 +99,32 @@ def _save_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
         }
 
     with open(os.path.join(proc_dir, "meta.json"), "w") as f:
-        json.dump({'version': 2, 'params': params}, f)
+        json.dump({'version': 3, 'params': params}, f)
     logger.info("Weight cache saved: %s (process %d, %d params)",
                 proc_dir, proc_idx, len(params))
+
+
+def _navigate_model(model: nnx.Module, parts):
+    """Navigate model module hierarchy by path parts."""
+    node = model
+    for part in parts:
+        try:
+            idx = int(part)
+            node = node[idx]
+        except (ValueError, TypeError):
+            node = getattr(node, part)
+    return node
 
 
 def _restore_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
     """Restore model weights per-process, matching by parameter path.
 
-    Uses nnx.State.flat_state() for canonical path matching, then navigates
-    the nested State dict to replace matched values in-place.
+    Handles tree structure differences between eval_shape model and the
+    saved (post-load_weights) model.  For example, FP8 MoE fuses
+    kernel_gating_EDF + kernel_up_proj_EDF into kernel_gating_upproj_EDF
+    during weight loading — the eval_shape model still has the unfused
+    layout.  This function detects such mismatches and adjusts the model
+    tree (delattr / setattr) before restoring weights.
     """
     import json
     import numpy as np
@@ -123,7 +139,44 @@ def _restore_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
     params = meta['params']
     local_devices = {d.id: d for d in jax.local_devices()}
 
-    # Load all cached arrays
+    # --- Phase 1: adjust model tree to match cache structure ---
+    _, state = nnx.split(model)
+    flat = state.flat_state()
+    model_paths = {'.'.join(str(p) for p in pt) for pt, _ in flat}
+    cache_paths = set(params.keys())
+
+    paths_to_remove = model_paths - cache_paths
+    paths_to_add = cache_paths - model_paths
+
+    if paths_to_remove or paths_to_add:
+        logger.info("Adjusting model tree: removing %d params, adding %d params",
+                     len(paths_to_remove), len(paths_to_add))
+        # Remove model params not present in cache
+        for path_str in sorted(paths_to_remove):
+            parts = path_str.split('.')
+            try:
+                parent = _navigate_model(model, parts[:-1])
+                delattr(parent, parts[-1])
+                logger.debug("  removed: %s", path_str)
+            except (AttributeError, IndexError, KeyError):
+                logger.warning("  failed to remove: %s", path_str)
+
+        # Add placeholder params for cache entries not in model
+        for path_str in sorted(paths_to_add):
+            parts = path_str.split('.')
+            try:
+                parent = _navigate_model(model, parts[:-1])
+                setattr(parent, parts[-1], nnx.Param(jnp.zeros(1)))
+                logger.debug("  added placeholder: %s", path_str)
+            except (AttributeError, IndexError, KeyError):
+                logger.warning("  failed to add placeholder: %s (parent missing)",
+                               path_str)
+
+        # Re-split after tree adjustment
+        _, state = nnx.split(model)
+        flat = state.flat_state()
+
+    # --- Phase 2: load cached arrays ---
     loaded_arrays = {}
     for path_str, info in params.items():
         data = dict(np.load(os.path.join(proc_dir, info['file'])))
@@ -142,35 +195,23 @@ def _restore_weight_cache(model: nnx.Module, cache_dir: str, mesh: Mesh):
         loaded_arrays[path_str] = jax.make_array_from_single_device_arrays(
             shape, sharding, per_device)
 
-    # Get current model state and match by canonical path
-    _, state = nnx.split(model)
-    flat = state.flat_state()
-
+    # --- Phase 3: replace model state with cached arrays ---
     matched = 0
-    model_paths = set()
-    unmatched_model = []
+    unmatched = []
     for path_tuple, var in flat:
         path_str = '.'.join(str(p) for p in path_tuple)
-        model_paths.add(path_str)
         if path_str in loaded_arrays:
-            # Navigate the nested state dict and replace
             node = state
             for key in path_tuple[:-1]:
                 node = node[key]
             node[path_tuple[-1]] = type(var)(loaded_arrays[path_str])
             matched += 1
         else:
-            unmatched_model.append(path_str)
+            unmatched.append(path_str)
 
-    # Log diagnostic info
-    cache_paths = set(params.keys())
-    only_in_cache = cache_paths - model_paths
-    if only_in_cache:
-        logger.warning("Paths in cache but NOT in model (%d): %s",
-                       len(only_in_cache), sorted(only_in_cache)[:10])
-    if unmatched_model:
-        logger.warning("Paths in model but NOT in cache (%d): %s",
-                       len(unmatched_model), sorted(unmatched_model)[:10])
+    if unmatched:
+        logger.warning("Params still unmatched after tree adjustment (%d): %s",
+                       len(unmatched), sorted(unmatched)[:10])
 
     nnx.update(model, state)
     logger.info("Weight cache restored: %s (process %d, %d/%d params matched)",
