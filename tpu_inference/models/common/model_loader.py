@@ -221,8 +221,13 @@ _MODEL_REGISTRY = {}
 
 # List of architectures that are preferred to use  "vllm" implementation over
 # "flax_nnx" implementation due to various factors such as performance.
+# NOTE(shunwang): Qwen3MoeForCausalLM temporarily removed to use flax_nnx path,
+# because the vllm wrapper path triggers @support_torch_compile which calls
+# torch._dynamo and fails on TPU/JAX ("PyTorch is not linked with support for
+# jax devices"). Add it back here once the vllm wrapper compilation issue is
+# resolved or when vllm path performance is needed.
 _VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset(
-    {"GptOssForCausalLM", "Qwen3MoeForCausalLM"})
+    {"GptOssForCausalLM"})
 
 # List of architectures that don't have pipeline parallelism support in jax yet.
 _PP_DISABLED_MODELS: frozenset[str] = frozenset(
@@ -244,6 +249,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     from tpu_inference.models.jax.glm5 import Glm5ForCausalLM
     from tpu_inference.models.jax.gpt_oss import GptOss
     from tpu_inference.models.jax.llama3 import LlamaForCausalLM
+    from tpu_inference.models.jax.mimo_v2 import MiMoV2FlashForCausalLM
     from tpu_inference.models.jax.llama4 import Llama4ForCausalLM
     from tpu_inference.models.jax.llama_eagle3 import EagleLlama3ForCausalLM
     from tpu_inference.models.jax.llama_guard_4 import LlamaGuard4ForCausalLM
@@ -274,6 +280,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     _MODEL_REGISTRY["Eagle3LlamaForCausalLM"] = EagleLlama3ForCausalLM
     _MODEL_REGISTRY["GptOssForCausalLM"] = GptOss
     _MODEL_REGISTRY["Qwen2ForCausalLM"] = Qwen2ForCausalLM
+    _MODEL_REGISTRY["MiMoV2FlashForCausalLM"] = MiMoV2FlashForCausalLM
 
     architectures = getattr(config, "architectures", [])
     for arch in architectures:
