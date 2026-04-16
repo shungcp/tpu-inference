@@ -113,67 +113,76 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
             }
 
         elif layer.moe_backend in [MoEBackend.GMM_EP, MoEBackend.GMM_TP]:
-            if any(
-                    any(w is None for w in param._weights_to_load) for param in
-                [layer.kernel_gating_EDF, layer.kernel_up_proj_EDF]):
-                return False
-            # Guard: down_proj is assigned by _load_weights via
-            # assign_and_shard_param. When expert weights are spread across
-            # multiple safetensor files, gate/up _weights_to_load may be fully
-            # populated before down_proj is concatenated and assigned.
+            # Process gate/up eagerly when ready, independent of down_proj.
+            # This frees _weights_to_load immediately to prevent OOM from
+            # accumulated expert weights (12.8GB per layer) when down_proj
+            # from later safetensor files hasn't been assigned yet.
+            gate_has_wtl = (hasattr(layer, 'kernel_gating_EDF') and
+                           '_weights_to_load' in layer.kernel_gating_EDF.get_metadata())
+            up_has_wtl = (hasattr(layer, 'kernel_up_proj_EDF') and
+                         '_weights_to_load' in layer.kernel_up_proj_EDF.get_metadata())
+
+            if gate_has_wtl and up_has_wtl:
+                if any(
+                        any(w is None for w in param._weights_to_load) for param in
+                    [layer.kernel_gating_EDF, layer.kernel_up_proj_EDF]):
+                    return False
+
+                # Each entry in _weights_to_load is (1, F, D); concat gives (E, F, D).
+                # Concatenation and transpose on CPU to avoid OOM; shard_put must be
+                # OUTSIDE cpu_mesh_context so it uses the TPU mesh.
+                from tpu_inference.layers.common.utils import cpu_mesh_context
+                with cpu_mesh_context():
+                    w_gate = jnp.concatenate(
+                        layer.kernel_gating_EDF._weights_to_load, axis=0)
+                    w_up = jnp.concatenate(
+                        layer.kernel_up_proj_EDF._weights_to_load, axis=0)
+                    if layer.moe_backend == MoEBackend.GMM_TP:
+                        # Store gate and up as SEPARATE pre-transposed (E, D, F) arrays.
+                        # Each is independently TP-sharded on the F axis (last dim) via
+                        # edf_sharding = P(None, None, 'tp'), so each chip gets (E, D, F/TP)
+                        # of the correct gate or up data.
+                        w_gate_t = w_gate.swapaxes(1, 2)  # (E, F, D) → (E, D, F)
+                        w_up_t = w_up.swapaxes(1, 2)      # (E, F, D) → (E, D, F)
+                    else:
+                        w13_val = jnp.concatenate([w_gate, w_up], axis=1)  # (E, 2F, D)
+
+                # shard_put outside cpu_mesh_context → uses the TPU mesh.
+                # Shards to TPU immediately so _weights_to_load can be freed.
+                if layer.moe_backend == MoEBackend.GMM_TP:
+                    layer.kernel_gating_EDF = nnx.Param(
+                        shard_put(w_gate_t, shardings=layer.edf_sharding))
+                    layer.kernel_up_proj_EDF = nnx.Param(
+                        shard_put(w_up_t, shardings=layer.edf_sharding))
+                else:
+                    # For EP: store as (E, 2F, D); edf_sharding = P('expert', None, None)
+                    # shards the E axis.  apply_jax swapaxes(1,2) → (E, D, 2F) = w1, and
+                    # E-sharding matches ep_p_spec = P(EXPERT) inside the shard_map.
+                    layer.kernel_gating_upproj_EDF = nnx.Param(
+                        shard_put(w13_val, shardings=layer.edf_sharding))
+                    del layer.kernel_gating_EDF
+                    del layer.kernel_up_proj_EDF
+
+            # Wait for down_proj to be assigned by _load_weights via
+            # assign_and_shard_param.  When expert weights are spread across
+            # multiple safetensor files, gate/up may be fully populated (and
+            # processed above) before down_proj is concatenated and assigned.
             if isinstance(layer.kernel_down_proj_EFD.value,
                           jax.ShapeDtypeStruct):
                 return False
 
-            # Each entry in _weights_to_load is (1, F, D); concat gives (E, F, D).
-            # Concatenation and transpose on CPU to avoid OOM; shard_put must be
-            # OUTSIDE cpu_mesh_context so it uses the TPU mesh.
-            from tpu_inference.layers.common.utils import cpu_mesh_context
-            with cpu_mesh_context():
-                w_gate = jnp.concatenate(
-                    layer.kernel_gating_EDF._weights_to_load, axis=0)
-                w_up = jnp.concatenate(
-                    layer.kernel_up_proj_EDF._weights_to_load, axis=0)
-                if layer.moe_backend == MoEBackend.GMM_TP:
-                    # Store gate and up as SEPARATE pre-transposed (E, D, F) arrays.
-                    # Each is independently TP-sharded on the F axis (last dim) via
-                    # edf_sharding = P(None, None, 'tp'), so each chip gets (E, D, F/TP)
-                    # of the correct gate or up data.  This avoids:
-                    #  - reorder_concatenated_tensor_for_sharding (no fused tensor)
-                    #  - HLO copy buffers from slicing inside shard_map (no slicing)
-                    #  - fuse_act num_lanes constraint (separate GMMs, no fuse_act)
-                    w_gate_t = w_gate.swapaxes(1, 2)  # (E, F, D) → (E, D, F)
-                    w_up_t = w_up.swapaxes(1, 2)      # (E, F, D) → (E, D, F)
-                else:
-                    w13_val = jnp.concatenate([w_gate, w_up], axis=1)  # (E, 2F, D)
-
-            # shard_put outside cpu_mesh_context → uses the TPU mesh
             # Use Layout((0, 1, 2)) to match the GMM kernel's expected layout
             # and avoid XLA layout-conversion copies that cause HLO temp OOM.
             if layer.moe_backend == MoEBackend.GMM_TP:
                 layout_3d = Layout((0, 1, 2))
                 edf_ns = NS(layer.mesh, P(*layer.edf_sharding))
-                # Two-step: shard_put moves CPU→TPU, then general_device_put
-                # applies Layout((0,1,2)) to match GMM kernel's expected layout
-                # and eliminate XLA layout-conversion copy buffers (HLO temp).
-                w_gate_tpu = shard_put(w_gate_t, shardings=layer.edf_sharding)
-                w_up_tpu = shard_put(w_up_t, shardings=layer.edf_sharding)
                 layer.kernel_gating_EDF = nnx.Param(
-                    general_device_put(w_gate_tpu, edf_ns, layout=layout_3d))
+                    general_device_put(layer.kernel_gating_EDF.value, edf_ns, layout=layout_3d))
                 layer.kernel_up_proj_EDF = nnx.Param(
-                    general_device_put(w_up_tpu, edf_ns, layout=layout_3d))
-                # Also re-put down_proj with correct layout.
+                    general_device_put(layer.kernel_up_proj_EDF.value, edf_ns, layout=layout_3d))
                 layer.kernel_down_proj_EFD = nnx.Param(
                     general_device_put(layer.kernel_down_proj_EFD.value,
                                        edf_ns, layout=layout_3d))
-            else:
-                # For EP: store as (E, 2F, D); edf_sharding = P('expert', None, None)
-                # shards the E axis.  apply_jax swapaxes(1,2) → (E, D, 2F) = w1, and
-                # E-sharding matches ep_p_spec = P(EXPERT) inside the shard_map.
-                layer.kernel_gating_upproj_EDF = nnx.Param(
-                    shard_put(w13_val, shardings=layer.edf_sharding))
-                del layer.kernel_gating_EDF
-                del layer.kernel_up_proj_EDF
 
         return True
 
