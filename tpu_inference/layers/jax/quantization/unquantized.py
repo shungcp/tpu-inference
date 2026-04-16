@@ -39,6 +39,26 @@ _logger = init_logger(__name__)
 from jax.experimental.layout import Layout
 from jax.sharding import NamedSharding as NS
 
+# Deferred layout operations. Layout application triggers
+# jax.device_put(distributed_array, Format(layout, sharding)) which compiles
+# XLA programs on the distributed mesh.  During async multi-host weight
+# loading, hosts reach process_weights_after_loading at different times,
+# so these programs execute in different order → GSPMD "launch group
+# mismatch" → SLICE_FAILURE_SW_INJECT_ERROR.
+# Instead, we collect layout functions here and apply them after all hosts
+# sync via sync_global_devices in model_loader.py.
+_deferred_layout_fns: list = []
+
+
+def apply_deferred_layouts():
+    """Apply all deferred layout operations. Must be called after
+    sync_global_devices to ensure all hosts execute in the same order."""
+    if _deferred_layout_fns:
+        _logger.info("Applying %d deferred layout operations", len(_deferred_layout_fns))
+    for fn in _deferred_layout_fns:
+        fn()
+    _deferred_layout_fns.clear()
+
 
 class UnquantizedLinearMethod(QuantizeMethodBase,
                               jax_common.UnquantizedLinearMethod):
@@ -209,18 +229,23 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
 
             # Use Layout((0, 1, 2)) to match the GMM kernel's expected layout
             # and avoid XLA layout-conversion copies that cause HLO temp OOM.
+            # DEFERRED: layout application triggers jax.device_put on distributed
+            # arrays, compiling XLA programs.  Collect it here; model_loader.py
+            # calls apply_deferred_layouts() after sync_global_devices.
             if layer.moe_backend == MoEBackend.GMM_TP:
-                _logger.info("%s: applying layout to gate/up/down on TPU", layer.prefix)
-                layout_3d = Layout((0, 1, 2))
-                edf_ns = NS(layer.mesh, P(*layer.edf_sharding))
-                layer.kernel_gating_EDF = nnx.Param(
-                    general_device_put(layer.kernel_gating_EDF.value, edf_ns, layout=layout_3d))
-                layer.kernel_up_proj_EDF = nnx.Param(
-                    general_device_put(layer.kernel_up_proj_EDF.value, edf_ns, layout=layout_3d))
-                layer.kernel_down_proj_EFD = nnx.Param(
-                    general_device_put(layer.kernel_down_proj_EFD.value,
-                                       edf_ns, layout=layout_3d))
-                _logger.info("%s: layout application done", layer.prefix)
+                def _apply_layout(layer=layer):
+                    layout_3d = Layout((0, 1, 2))
+                    edf_ns = NS(layer.mesh, P(*layer.edf_sharding))
+                    _logger.info("%s: applying deferred layout to gate/up/down on TPU", layer.prefix)
+                    layer.kernel_gating_EDF = nnx.Param(
+                        general_device_put(layer.kernel_gating_EDF.value, edf_ns, layout=layout_3d))
+                    layer.kernel_up_proj_EDF = nnx.Param(
+                        general_device_put(layer.kernel_up_proj_EDF.value, edf_ns, layout=layout_3d))
+                    layer.kernel_down_proj_EFD = nnx.Param(
+                        general_device_put(layer.kernel_down_proj_EFD.value,
+                                           edf_ns, layout=layout_3d))
+                    _logger.info("%s: deferred layout done", layer.prefix)
+                _deferred_layout_fns.append(_apply_layout)
 
         return True
 

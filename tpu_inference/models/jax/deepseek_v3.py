@@ -585,24 +585,32 @@ class MLAEinsum(JaxEinsum):
             _source_mesh = cpu_mesh()
             del self._cpu_weight_data
         mla_layer = self.mla_layer
+        # Use nnx.eval_shape to create JaxEinsum modules with abstract params
+        # (ShapeDtypeStruct) instead of concrete random initialization.
+        # Without this, lecun_normal() triggers jit__truncated_normal and
+        # jit__threefry_seed on the TPU mesh.  During async multi-host weight
+        # loading, hosts reach this point at different times, so these XLA
+        # programs execute in different order across hosts → GSPMD detects
+        # "launch group mismatch" → SLICE_FAILURE_SW_INJECT_ERROR.
+        # Real weights are assigned via general_device_put immediately after.
         setattr(
             mla_layer, "k_up_proj",
-            JaxEinsum(
+            nnx.eval_shape(lambda: JaxEinsum(
                 einsum_str="TNH,ANH->TNA",
                 kernel_shape=(A, N, qk_nope_head_dim),
                 rngs=nnx.Rngs(0),
                 prefix=mla_layer.prefix + ".k_up_proj",
                 quant_config=self.quant_config,
-            ))
+            )))
         setattr(
             mla_layer, "v_up_proj",
-            JaxEinsum(
+            nnx.eval_shape(lambda: JaxEinsum(
                 einsum_str="TNA,ANH->TNH",
                 kernel_shape=(A, N, v_head_dim),
                 rngs=nnx.Rngs(0),
                 prefix=mla_layer.prefix + ".v_up_proj",
                 quant_config=self.quant_config,
-            ))
+            )))
         _mesh = get_mesh()
         _anh = self.mla_layer.anh_sharding
         mla_layer.k_up_proj.weight.value = general_device_put(

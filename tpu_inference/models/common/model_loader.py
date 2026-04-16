@@ -443,7 +443,18 @@ def _get_nnx_model(
             # TPU runtime injects SLICE_FAILURE_SW_INJECT_ERROR.
             jax.experimental.multihost_utils.sync_global_devices(
                 "weight_loading_done")
-            logger.info("All hosts finished weight loading, entering create_jit_model")
+            logger.info("All hosts finished weight loading")
+            # Apply deferred MoE weight layouts.  These were deferred because
+            # jax.device_put with Format/Layout on distributed arrays triggers
+            # XLA programs; during async weight loading the order would differ
+            # across hosts.  Now that all hosts are synchronized, layouts are
+            # applied in deterministic order.
+            from tpu_inference.layers.jax.quantization.unquantized import (
+                apply_deferred_layouts)
+            apply_deferred_layouts()
+            jax.experimental.multihost_utils.sync_global_devices(
+                "deferred_layouts_done")
+            logger.info("Deferred layouts applied, entering create_jit_model")
             jit_model = create_jit_model(
                 model,
                 use_qwix_on_abstract_model=should_apply_qwix_on_abstract_model)
