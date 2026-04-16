@@ -1484,19 +1484,32 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             sharding=data_parallel_attn_sharding,
         )
         if self.uses_mrope:
-            positions = mrope_positions
+            mrope_sharding = NamedSharding(
+                self.mesh, PartitionSpec(None, ShardingAxisName.ATTN_DATA))
+            positions = device_array(self.mesh,
+                                     mrope_positions,
+                                     sharding=mrope_sharding)
 
         query_start_loc_cpu = query_start_loc
         logits_indices_cpu = logits_indices
         seq_lens_cpu = seq_lens
 
-        (input_ids, positions, query_start_loc, seq_lens, logits_indices,
-         request_distribution) = device_array(
-             self.mesh,
-             (input_ids, positions, query_start_loc, seq_lens, logits_indices,
-              request_distribution),
-             sharding=data_parallel_attn_sharding,
-         )
+        if self.uses_mrope:
+            (input_ids, query_start_loc, seq_lens, logits_indices,
+             request_distribution) = device_array(
+                 self.mesh,
+                 (input_ids, query_start_loc, seq_lens, logits_indices,
+                  request_distribution),
+                 sharding=data_parallel_attn_sharding,
+             )
+        else:
+            (input_ids, positions, query_start_loc, seq_lens, logits_indices,
+             request_distribution) = device_array(
+                 self.mesh,
+                 (input_ids, positions, query_start_loc, seq_lens,
+                  logits_indices, request_distribution),
+                 sharding=data_parallel_attn_sharding,
+             )
 
         def build_block_table(kv_cache_gid: int) -> jax.Array:
             block_tables = self.block_tables_cpu[kv_cache_gid][:self.
@@ -1717,17 +1730,31 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             sharding=data_parallel_attn_sharding,
         )
         if self.uses_mrope:
-            positions = mrope_positions
+            mrope_sharding = NamedSharding(
+                self.mesh, PartitionSpec(None, ShardingAxisName.ATTN_DATA))
+            positions = device_array(self.mesh,
+                                     mrope_positions,
+                                     sharding=mrope_sharding)
+
         query_start_loc_cpu = query_start_loc
         seq_lens_cpu = seq_lens
 
-        (input_ids, positions, query_start_loc, seq_lens, logits_indices,
-         request_distribution) = device_array(
-             self.mesh,
-             (input_ids, positions, query_start_loc, seq_lens, logits_indices,
-              request_distribution),
-             sharding=data_parallel_attn_sharding,
-         )
+        if self.uses_mrope:
+            (input_ids, query_start_loc, seq_lens, logits_indices,
+             request_distribution) = device_array(
+                 self.mesh,
+                 (input_ids, query_start_loc, seq_lens, logits_indices,
+                  request_distribution),
+                 sharding=data_parallel_attn_sharding,
+             )
+        else:
+            (input_ids, positions, query_start_loc, seq_lens, logits_indices,
+             request_distribution) = device_array(
+                 self.mesh,
+                 (input_ids, positions, query_start_loc, seq_lens,
+                  logits_indices, request_distribution),
+                 sharding=data_parallel_attn_sharding,
+             )
 
         def build_block_table(kv_cache_gid: int) -> jax.Array:
             block_tables = self.block_tables_cpu[kv_cache_gid][:self.
