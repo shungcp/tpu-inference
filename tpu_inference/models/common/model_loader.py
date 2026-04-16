@@ -436,6 +436,14 @@ def _get_nnx_model(
                     logger.info("Saving weight cache to: %s",
                                 _WEIGHT_CACHE_DIR)
                     _save_weight_cache(model, _WEIGHT_CACHE_DIR, mesh)
+            # Barrier: all hosts must finish weight loading before any host
+            # enters create_jit_model.  The @nnx.jit compilation produces an
+            # XLA program on distributed arrays; if hosts arrive at different
+            # times, the GSPMD compilation or execution can deadlock and the
+            # TPU runtime injects SLICE_FAILURE_SW_INJECT_ERROR.
+            jax.experimental.multihost_utils.sync_global_devices(
+                "weight_loading_done")
+            logger.info("All hosts finished weight loading, entering create_jit_model")
             jit_model = create_jit_model(
                 model,
                 use_qwix_on_abstract_model=should_apply_qwix_on_abstract_model)
