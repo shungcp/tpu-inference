@@ -317,6 +317,16 @@ class JaxMoE(JaxModule):
         # across multiple safetensor files (or when checkpoint ordering causes the same module
         # to be visited via multiple non-consecutive groupby groups).  Skip params that were
         # already sharded in a previous call (marked by _is_loaded).
+        # Determine the correct sharding spec for each param.  We cannot
+        # rely on param.get_metadata()["sharding"] because set_metadata()
+        # (called in __post_init__ to store _weights_to_load) may have
+        # replaced the entire metadata dict, losing the original sharding.
+        param_shardings = {
+            "kernel_down_proj_EFD": self.edf_sharding if is_fused_backend else self.efd_sharding,
+            "kernel_gating_EDF": self.edf_sharding,
+            "kernel_up_proj_EDF": self.edf_sharding,
+        }
+
         for param_name, param in params_to_assign.items():
             if '_weights_to_load' not in param.get_metadata():
                 # Param was replaced (e.g. by process_weights_after_loading
@@ -336,8 +346,13 @@ class JaxMoE(JaxModule):
                 for i in range(len(weights_to_load)):
                     weights_to_load[i] = None
                 try:
-                    assign_and_shard_param(param, weights, param_name,
-                                           mesh=self.mesh)
+                    # Use explicit sharding spec instead of reading from param
+                    # metadata (which may have been overwritten by set_metadata).
+                    spec = param_shardings[param_name]
+                    param.value = shard_put(weights, spec, mesh=self.mesh)
+                    param.set_metadata(_is_loaded=True)
+                    del weights
+                    jax.clear_caches()
                     loaded_names.add(param_name)
                 except Exception as e:
                     raise RuntimeError(
