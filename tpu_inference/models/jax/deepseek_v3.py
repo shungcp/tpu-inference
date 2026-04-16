@@ -524,20 +524,38 @@ class MLAEinsum(JaxEinsum):
         # After loading, split the weights into k/v
         A, N, qk_nope_head_dim, v_head_dim = self.mla_layer.kv_lora_rank, self.mla_layer.N, self.mla_layer.qk_nope_head_dim, self.mla_layer.v_head_dim
         is_quantized = self.quant_config is not None and hasattr(self, 'weight_scale_inv')
-        with cpu_mesh_context():
-            if is_quantized:
+        if is_quantized:
+            with cpu_mesh_context():
                 dequantized_weight = dequantize_tensor(
                     self.weight,
                     self.weight_scale_inv,
                     (0, 1),
                     block_size=None,
                 ).T
-            else:
-                # BF16: use JAX array directly (np.asarray fails in multi-host)
-                dequantized_weight = self.weight.value
-                expected_shape = (A, N * (qk_nope_head_dim + v_head_dim))
-                if dequantized_weight.shape != expected_shape:
-                    dequantized_weight = jnp.matrix_transpose(dequantized_weight)
+                if dequantized_weight.shape != (A, N *
+                                                (qk_nope_head_dim + v_head_dim)):
+                    raise ValueError(
+                        f"Unexpected weight shape: {dequantized_weight.shape}, expected {(A, N * (qk_nope_head_dim + v_head_dim))=}"
+                    )
+                dequantized_weight = dequantized_weight.reshape(
+                    A, N, qk_nope_head_dim + v_head_dim)
+                k_ANH, v_ANH = jnp.split(dequantized_weight, [qk_nope_head_dim],
+                                         axis=-1)
+                k_ANH_weight, k_ANH_scale = quantize_tensor(k_ANH,
+                                                            self.weight.dtype,
+                                                            dim=-1)
+                v_ANH_weight, v_1NH_scale = quantize_tensor(v_ANH,
+                                                            self.weight.dtype,
+                                                            dim=0)
+                k_N1A_scale = k_ANH_scale.transpose(1, 2, 0)
+                v_N1H_scale = v_1NH_scale.transpose(1, 0, 2)
+            _source_mesh = cpu_mesh()
+        else:
+            # BF16: weight is already on TPU, process outside cpu_mesh_context
+            dequantized_weight = self.weight.value
+            expected_shape = (A, N * (qk_nope_head_dim + v_head_dim))
+            if dequantized_weight.shape != expected_shape:
+                dequantized_weight = jnp.matrix_transpose(dequantized_weight)
             if dequantized_weight.shape != (A, N *
                                             (qk_nope_head_dim + v_head_dim)):
                 raise ValueError(
@@ -547,20 +565,9 @@ class MLAEinsum(JaxEinsum):
                 A, N, qk_nope_head_dim + v_head_dim)
             k_ANH, v_ANH = jnp.split(dequantized_weight, [qk_nope_head_dim],
                                      axis=-1)
-            if is_quantized:
-                k_ANH_weight, k_ANH_scale = quantize_tensor(k_ANH,
-                                                            self.weight.dtype,
-                                                            dim=-1)
-                v_ANH_weight, v_1NH_scale = quantize_tensor(v_ANH,
-                                                            self.weight.dtype,
-                                                            dim=0)
-                # As of writing, sharded_quantized_batched_matmul expects scale to be
-                # a different shape order than weight
-                k_N1A_scale = k_ANH_scale.transpose(1, 2, 0)
-                v_N1H_scale = v_1NH_scale.transpose(1, 0, 2)
-            else:
-                k_ANH_weight = k_ANH
-                v_ANH_weight = v_ANH
+            k_ANH_weight = k_ANH
+            v_ANH_weight = v_ANH
+            _source_mesh = get_mesh()
         mla_layer = self.mla_layer
         setattr(
             mla_layer, "k_up_proj",
@@ -582,12 +589,12 @@ class MLAEinsum(JaxEinsum):
             ))
         _mesh = get_mesh()
         _anh = self.mla_layer.anh_sharding
-        _cpu = cpu_mesh()
         mla_layer.k_up_proj.weight.value = general_device_put(
-            k_ANH_weight, NamedSharding(_mesh, P(*_anh)), source_mesh=_cpu)
+            k_ANH_weight, NamedSharding(_mesh, P(*_anh)), source_mesh=_source_mesh)
         mla_layer.v_up_proj.weight.value = general_device_put(
-            v_ANH_weight, NamedSharding(_mesh, P(*_anh)), source_mesh=_cpu)
+            v_ANH_weight, NamedSharding(_mesh, P(*_anh)), source_mesh=_source_mesh)
         if is_quantized:
+            _cpu = cpu_mesh()
             mla_layer.k_up_proj.weight_scale_inv.value = general_device_put(
                 k_N1A_scale, NamedSharding(_mesh, P()), source_mesh=_cpu)
             mla_layer.v_up_proj.weight_scale_inv.value = general_device_put(
