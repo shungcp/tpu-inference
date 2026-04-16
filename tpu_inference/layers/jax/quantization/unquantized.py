@@ -114,9 +114,12 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
 
         elif layer.moe_backend in [MoEBackend.GMM_EP, MoEBackend.GMM_TP]:
             # Process gate/up eagerly when ready, independent of down_proj.
-            # This frees _weights_to_load immediately to prevent OOM from
-            # accumulated expert weights (12.8GB per layer) when down_proj
-            # from later safetensor files hasn't been assigned yet.
+            # Gate and up are processed SEQUENTIALLY to limit peak CPU memory:
+            #   each has 256 × (1,2048,6144) × 2B ≈ 6.4GB in _weights_to_load.
+            #   Sequential + eager cleanup: peak ~19GB vs ~38GB simultaneous.
+            import gc
+            from tpu_inference.layers.common.utils import cpu_mesh_context
+
             gate_has_wtl = (hasattr(layer, 'kernel_gating_EDF') and
                            '_weights_to_load' in layer.kernel_gating_EDF.get_metadata())
             up_has_wtl = (hasattr(layer, 'kernel_up_proj_EDF') and
@@ -128,40 +131,61 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
                     [layer.kernel_gating_EDF, layer.kernel_up_proj_EDF]):
                     return False
 
-                # Each entry in _weights_to_load is (1, F, D); concat gives (E, F, D).
-                # Concatenation and transpose on CPU to avoid OOM; shard_put must be
-                # OUTSIDE cpu_mesh_context so it uses the TPU mesh.
-                from tpu_inference.layers.common.utils import cpu_mesh_context
-                with cpu_mesh_context():
-                    w_gate = jnp.concatenate(
-                        layer.kernel_gating_EDF._weights_to_load, axis=0)
-                    w_up = jnp.concatenate(
-                        layer.kernel_up_proj_EDF._weights_to_load, axis=0)
-                    if layer.moe_backend == MoEBackend.GMM_TP:
-                        # Store gate and up as SEPARATE pre-transposed (E, D, F) arrays.
-                        # Each is independently TP-sharded on the F axis (last dim) via
-                        # edf_sharding = P(None, None, 'tp'), so each chip gets (E, D, F/TP)
-                        # of the correct gate or up data.
-                        w_gate_t = w_gate.swapaxes(1, 2)  # (E, F, D) → (E, D, F)
-                        w_up_t = w_up.swapaxes(1, 2)      # (E, F, D) → (E, D, F)
-                    else:
-                        w13_val = jnp.concatenate([w_gate, w_up], axis=1)  # (E, 2F, D)
-
-                # shard_put outside cpu_mesh_context → uses the TPU mesh.
-                # Shards to TPU immediately so _weights_to_load can be freed.
                 if layer.moe_backend == MoEBackend.GMM_TP:
+                    # --- process gate ---
+                    with cpu_mesh_context():
+                        w_gate = jnp.concatenate(
+                            layer.kernel_gating_EDF._weights_to_load, axis=0)
+                    # Free _weights_to_load entries immediately
+                    for i in range(len(layer.kernel_gating_EDF._weights_to_load)):
+                        layer.kernel_gating_EDF._weights_to_load[i] = None
+                    with cpu_mesh_context():
+                        w_gate_t = w_gate.swapaxes(1, 2)  # (E, F, D) → (E, D, F)
+                    del w_gate
                     layer.kernel_gating_EDF = nnx.Param(
                         shard_put(w_gate_t, shardings=layer.edf_sharding))
+                    del w_gate_t
+                    gc.collect()
+                    jax.clear_caches()
+
+                    # --- process up ---
+                    with cpu_mesh_context():
+                        w_up = jnp.concatenate(
+                            layer.kernel_up_proj_EDF._weights_to_load, axis=0)
+                    for i in range(len(layer.kernel_up_proj_EDF._weights_to_load)):
+                        layer.kernel_up_proj_EDF._weights_to_load[i] = None
+                    with cpu_mesh_context():
+                        w_up_t = w_up.swapaxes(1, 2)  # (E, F, D) → (E, D, F)
+                    del w_up
                     layer.kernel_up_proj_EDF = nnx.Param(
                         shard_put(w_up_t, shardings=layer.edf_sharding))
+                    del w_up_t
+                    gc.collect()
+                    jax.clear_caches()
+
                 else:
-                    # For EP: store as (E, 2F, D); edf_sharding = P('expert', None, None)
-                    # shards the E axis.  apply_jax swapaxes(1,2) → (E, D, 2F) = w1, and
-                    # E-sharding matches ep_p_spec = P(EXPERT) inside the shard_map.
+                    # GMM_EP: fuse gate+up into (E, 2F, D)
+                    with cpu_mesh_context():
+                        w_gate = jnp.concatenate(
+                            layer.kernel_gating_EDF._weights_to_load, axis=0)
+                    for i in range(len(layer.kernel_gating_EDF._weights_to_load)):
+                        layer.kernel_gating_EDF._weights_to_load[i] = None
+                    gc.collect()
+                    with cpu_mesh_context():
+                        w_up = jnp.concatenate(
+                            layer.kernel_up_proj_EDF._weights_to_load, axis=0)
+                    for i in range(len(layer.kernel_up_proj_EDF._weights_to_load)):
+                        layer.kernel_up_proj_EDF._weights_to_load[i] = None
+                    with cpu_mesh_context():
+                        w13_val = jnp.concatenate([w_gate, w_up], axis=1)
+                    del w_gate, w_up
                     layer.kernel_gating_upproj_EDF = nnx.Param(
                         shard_put(w13_val, shardings=layer.edf_sharding))
+                    del w13_val
                     del layer.kernel_gating_EDF
                     del layer.kernel_up_proj_EDF
+                    gc.collect()
+                    jax.clear_caches()
 
             # Wait for down_proj to be assigned by _load_weights via
             # assign_and_shard_param.  When expert weights are spread across
@@ -170,6 +194,12 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
             if isinstance(layer.kernel_down_proj_EFD.value,
                           jax.ShapeDtypeStruct):
                 return False
+
+            # Also free down_proj _weights_to_load (6.4GB) if still held.
+            if '_weights_to_load' in layer.kernel_down_proj_EFD.get_metadata():
+                for i in range(len(layer.kernel_down_proj_EFD._weights_to_load)):
+                    layer.kernel_down_proj_EFD._weights_to_load[i] = None
+                gc.collect()
 
             # Use Layout((0, 1, 2)) to match the GMM kernel's expected layout
             # and avoid XLA layout-conversion copies that cause HLO temp OOM.

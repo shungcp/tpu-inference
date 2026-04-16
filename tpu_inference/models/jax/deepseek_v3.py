@@ -514,16 +514,25 @@ class MLAEinsum(JaxEinsum):
             raise ValueError(
                 f"Expect at most 2 params to load for kv_b_proj, already got {self.loaded}, still have {[name for name, _ in weights]} coming."
             )
+        is_quantized = self.quant_config is not None and hasattr(self, 'weight_scale_inv')
         for name, weight in weights:
             param = named_params[name]
-            weight_loader = getattr(param, "weight_loader")
-            weight_loader(param, weight)
+            if name == 'weight' and not is_quantized:
+                # BF16: keep weight on CPU. Do NOT call weight_loader which
+                # distributes to TPU via shard_put.  Operations on distributed
+                # TPU arrays (transpose, reshape, split) trigger cross-host XLA
+                # collectives.  Hosts load weights at different speeds, so those
+                # collectives deadlock → SLICE_FAILURE_SW_INJECT_ERROR.
+                from tpu_inference.models.jax.utils.weight_utils import jax_array_from_reshaped_torch
+                self._cpu_weight_data = jax_array_from_reshaped_torch(weight)
+            else:
+                weight_loader = getattr(param, "weight_loader")
+                weight_loader(param, weight)
             self.loaded.add(name)
         if len(self.loaded) != len(named_params):
             return
         # After loading, split the weights into k/v
         A, N, qk_nope_head_dim, v_head_dim = self.mla_layer.kv_lora_rank, self.mla_layer.N, self.mla_layer.qk_nope_head_dim, self.mla_layer.v_head_dim
-        is_quantized = self.quant_config is not None and hasattr(self, 'weight_scale_inv')
         if is_quantized:
             with cpu_mesh_context():
                 dequantized_weight = dequantize_tensor(
@@ -551,23 +560,28 @@ class MLAEinsum(JaxEinsum):
                 v_N1H_scale = v_1NH_scale.transpose(1, 0, 2)
             _source_mesh = cpu_mesh()
         else:
-            # BF16: weight is already on TPU, process outside cpu_mesh_context
-            dequantized_weight = self.weight.value
-            expected_shape = (A, N * (qk_nope_head_dim + v_head_dim))
-            if dequantized_weight.shape != expected_shape:
-                dequantized_weight = jnp.matrix_transpose(dequantized_weight)
-            if dequantized_weight.shape != (A, N *
-                                            (qk_nope_head_dim + v_head_dim)):
-                raise ValueError(
-                    f"Unexpected weight shape: {dequantized_weight.shape}, expected {(A, N * (qk_nope_head_dim + v_head_dim))=}"
-                )
-            dequantized_weight = dequantized_weight.reshape(
-                A, N, qk_nope_head_dim + v_head_dim)
-            k_ANH, v_ANH = jnp.split(dequantized_weight, [qk_nope_head_dim],
-                                     axis=-1)
-            k_ANH_weight = k_ANH
-            v_ANH_weight = v_ANH
-            _source_mesh = get_mesh()
+            # BF16: process on CPU, same pattern as FP8 path.
+            # Each host processes its own copy independently — no cross-host
+            # synchronization needed.  general_device_put with
+            # source_mesh=cpu_mesh() distributes to TPU locally.
+            with cpu_mesh_context():
+                dequantized_weight = self._cpu_weight_data
+                expected_shape = (A, N * (qk_nope_head_dim + v_head_dim))
+                if dequantized_weight.shape != expected_shape:
+                    dequantized_weight = jnp.matrix_transpose(dequantized_weight)
+                if dequantized_weight.shape != (A, N *
+                                                (qk_nope_head_dim + v_head_dim)):
+                    raise ValueError(
+                        f"Unexpected weight shape: {dequantized_weight.shape}, expected {(A, N * (qk_nope_head_dim + v_head_dim))=}"
+                    )
+                dequantized_weight = dequantized_weight.reshape(
+                    A, N, qk_nope_head_dim + v_head_dim)
+                k_ANH, v_ANH = jnp.split(dequantized_weight, [qk_nope_head_dim],
+                                         axis=-1)
+                k_ANH_weight = k_ANH
+                v_ANH_weight = v_ANH
+            _source_mesh = cpu_mesh()
+            del self._cpu_weight_data
         mla_layer = self.mla_layer
         setattr(
             mla_layer, "k_up_proj",

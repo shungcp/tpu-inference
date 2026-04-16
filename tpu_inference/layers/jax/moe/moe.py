@@ -331,6 +331,10 @@ class JaxMoE(JaxModule):
                     continue
                 with cpu_mesh_context():
                     weights = jnp.concatenate(param._weights_to_load, axis=0)
+                # Free _weights_to_load entries to release CPU memory (~6.4GB
+                # for 256 experts) before shard_put allocates TPU buffers.
+                for i in range(len(weights_to_load)):
+                    weights_to_load[i] = None
                 try:
                     assign_and_shard_param(param, weights, param_name,
                                            mesh=self.mesh)
