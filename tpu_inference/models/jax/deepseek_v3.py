@@ -521,35 +521,43 @@ class MLAEinsum(JaxEinsum):
             self.loaded.add(name)
         if len(self.loaded) != len(named_params):
             return
-        assert self.quant_config is not None
         # After loading, split the weights into k/v
+        A, N, qk_nope_head_dim, v_head_dim = self.mla_layer.kv_lora_rank, self.mla_layer.N, self.mla_layer.qk_nope_head_dim, self.mla_layer.v_head_dim
+        is_quantized = self.quant_config is not None and hasattr(self, 'weight_scale_inv')
         with cpu_mesh_context():
-            dequantized_weight = dequantize_tensor(
-                self.weight,
-                self.weight_scale_inv,
-                (0, 1),
-                block_size=None,
-            ).T
-            A, N, qk_nope_head_dim, v_head_dim = self.mla_layer.kv_lora_rank, self.mla_layer.N, self.mla_layer.qk_nope_head_dim, self.mla_layer.v_head_dim
+            if is_quantized:
+                dequantized_weight = dequantize_tensor(
+                    self.weight,
+                    self.weight_scale_inv,
+                    (0, 1),
+                    block_size=None,
+                ).T
+            else:
+                import numpy as np
+                dequantized_weight = jnp.array(np.asarray(self.weight.value).T)
             if dequantized_weight.shape != (A, N *
                                             (qk_nope_head_dim + v_head_dim)):
                 raise ValueError(
-                    f"Unexpected weight shape after dequantization: {dequantized_weight.shape}, expected {(A, N * (qk_nope_head_dim + v_head_dim))=}"
+                    f"Unexpected weight shape: {dequantized_weight.shape}, expected {(A, N * (qk_nope_head_dim + v_head_dim))=}"
                 )
             dequantized_weight = dequantized_weight.reshape(
                 A, N, qk_nope_head_dim + v_head_dim)
             k_ANH, v_ANH = jnp.split(dequantized_weight, [qk_nope_head_dim],
                                      axis=-1)
-            k_ANH_weight, k_ANH_scale = quantize_tensor(k_ANH,
-                                                        self.weight.dtype,
-                                                        dim=-1)
-            v_ANH_weight, v_1NH_scale = quantize_tensor(v_ANH,
-                                                        self.weight.dtype,
-                                                        dim=0)
-            # As of writing, sharded_quantized_batched_matmul expects scale to be
-            # a different shape order than weight
-            k_N1A_scale = k_ANH_scale.transpose(1, 2, 0)
-            v_N1H_scale = v_1NH_scale.transpose(1, 0, 2)
+            if is_quantized:
+                k_ANH_weight, k_ANH_scale = quantize_tensor(k_ANH,
+                                                            self.weight.dtype,
+                                                            dim=-1)
+                v_ANH_weight, v_1NH_scale = quantize_tensor(v_ANH,
+                                                            self.weight.dtype,
+                                                            dim=0)
+                # As of writing, sharded_quantized_batched_matmul expects scale to be
+                # a different shape order than weight
+                k_N1A_scale = k_ANH_scale.transpose(1, 2, 0)
+                v_N1H_scale = v_1NH_scale.transpose(1, 0, 2)
+            else:
+                k_ANH_weight = k_ANH
+                v_ANH_weight = v_ANH
         mla_layer = self.mla_layer
         setattr(
             mla_layer, "k_up_proj",
@@ -569,28 +577,24 @@ class MLAEinsum(JaxEinsum):
                 prefix=mla_layer.prefix + ".v_up_proj",
                 quant_config=self.quant_config,
             ))
-        # In multi-host (ray) mode, CPU JAX arrays from cpu_mesh_context()
-        # may lack a recognizable source_mesh for shard_put, causing
-        # general_device_put to fail when slicing on TPU context.
-        # Fix: pass source_mesh=cpu_mesh() explicitly so general_device_put
-        # slices in the correct (CPU) context. This preserves FP8 dtypes
-        # which np.array() would silently corrupt.
         _mesh = get_mesh()
         _anh = self.mla_layer.anh_sharding
         _cpu = cpu_mesh()
-        # Cannot apply anh_sharding to scales, otherwise it complains about shape mismatch.
         mla_layer.k_up_proj.weight.value = general_device_put(
             k_ANH_weight, NamedSharding(_mesh, P(*_anh)), source_mesh=_cpu)
-        mla_layer.k_up_proj.weight_scale_inv.value = general_device_put(
-            k_N1A_scale, NamedSharding(_mesh, P()), source_mesh=_cpu)
         mla_layer.v_up_proj.weight.value = general_device_put(
             v_ANH_weight, NamedSharding(_mesh, P(*_anh)), source_mesh=_cpu)
-        mla_layer.v_up_proj.weight_scale_inv.value = general_device_put(
-            v_N1H_scale, NamedSharding(_mesh, P()), source_mesh=_cpu)
+        if is_quantized:
+            mla_layer.k_up_proj.weight_scale_inv.value = general_device_put(
+                k_N1A_scale, NamedSharding(_mesh, P()), source_mesh=_cpu)
+            mla_layer.v_up_proj.weight_scale_inv.value = general_device_put(
+                v_N1H_scale, NamedSharding(_mesh, P()), source_mesh=_cpu)
 
         delattr(self, 'weight')
-        delattr(self, 'weight_scale_inv')
-        delattr(self, 'quant_method')
+        if hasattr(self, 'weight_scale_inv'):
+            delattr(self, 'weight_scale_inv')
+        if hasattr(self, 'quant_method'):
+            delattr(self, 'quant_method')
 
 
 @dataclass(kw_only=True)
