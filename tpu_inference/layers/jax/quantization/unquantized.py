@@ -31,7 +31,10 @@ from tpu_inference.layers.jax.moe.moe import JaxMoE
 from tpu_inference.layers.jax.quantization import QuantizeMethodBase
 from tpu_inference.layers.jax.quantization.configs import QuantizationConfig
 from tpu_inference.layers.common.utils import general_device_put
+from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.utils.weight_utils import shard_put
+
+_logger = init_logger(__name__)
 
 from jax.experimental.layout import Layout
 from jax.sharding import NamedSharding as NS
@@ -81,6 +84,7 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
         Args:
             layer: The layer to process.
         """
+        _logger.info("process_weights_after_loading: %s backend=%s", layer.prefix, layer.moe_backend)
         if layer.moe_backend == MoEBackend.FUSED_MOE:
             if layer.edf_sharding:
                 e2df_sharding = (layer.edf_sharding[0], None,
@@ -133,6 +137,7 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
 
                 if layer.moe_backend == MoEBackend.GMM_TP:
                     # --- process gate ---
+                    _logger.info("%s: concatenating gate weights on CPU", layer.prefix)
                     with cpu_mesh_context():
                         w_gate = jnp.concatenate(
                             layer.kernel_gating_EDF._weights_to_load, axis=0)
@@ -148,6 +153,7 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
                     gc.collect()
                     jax.clear_caches()
 
+                    _logger.info("%s: gate shard_put done, concatenating up weights on CPU", layer.prefix)
                     # --- process up ---
                     with cpu_mesh_context():
                         w_up = jnp.concatenate(
@@ -204,6 +210,7 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
             # Use Layout((0, 1, 2)) to match the GMM kernel's expected layout
             # and avoid XLA layout-conversion copies that cause HLO temp OOM.
             if layer.moe_backend == MoEBackend.GMM_TP:
+                _logger.info("%s: applying layout to gate/up/down on TPU", layer.prefix)
                 layout_3d = Layout((0, 1, 2))
                 edf_ns = NS(layer.mesh, P(*layer.edf_sharding))
                 layer.kernel_gating_EDF = nnx.Param(
@@ -213,6 +220,7 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
                 layer.kernel_down_proj_EFD = nnx.Param(
                     general_device_put(layer.kernel_down_proj_EFD.value,
                                        edf_ns, layout=layout_3d))
+                _logger.info("%s: layout application done", layer.prefix)
 
         return True
 

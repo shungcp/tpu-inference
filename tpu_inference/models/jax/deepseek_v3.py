@@ -515,6 +515,7 @@ class MLAEinsum(JaxEinsum):
                 f"Expect at most 2 params to load for kv_b_proj, already got {self.loaded}, still have {[name for name, _ in weights]} coming."
             )
         is_quantized = self.quant_config is not None and hasattr(self, 'weight_scale_inv')
+        logger.info("MLAEinsum.load_weights: %s loaded=%s is_quantized=%s", self.mla_layer.prefix, self.loaded, is_quantized)
         for name, weight in weights:
             param = named_params[name]
             if name == 'weight' and not is_quantized:
@@ -531,6 +532,7 @@ class MLAEinsum(JaxEinsum):
             self.loaded.add(name)
         if len(self.loaded) != len(named_params):
             return
+        logger.info("MLAEinsum: decomposing kv_b_proj for %s (BF16=%s)", self.mla_layer.prefix, not is_quantized)
         # After loading, split the weights into k/v
         A, N, qk_nope_head_dim, v_head_dim = self.mla_layer.kv_lora_rank, self.mla_layer.N, self.mla_layer.qk_nope_head_dim, self.mla_layer.v_head_dim
         if is_quantized:
@@ -614,6 +616,7 @@ class MLAEinsum(JaxEinsum):
             mla_layer.v_up_proj.weight_scale_inv.value = general_device_put(
                 v_N1H_scale, NamedSharding(_mesh, P()), source_mesh=_cpu)
 
+        logger.info("MLAEinsum: kv_b_proj decomposition done for %s", self.mla_layer.prefix)
         delattr(self, 'weight')
         if hasattr(self, 'weight_scale_inv'):
             delattr(self, 'weight_scale_inv')

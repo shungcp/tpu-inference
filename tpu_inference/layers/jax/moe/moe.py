@@ -297,7 +297,7 @@ class JaxMoE(JaxModule):
                 reshape_dims=(1,) + torch_weight.shape)
             jax_param._weights_to_load[expert_id] = jax_weight
 
-        logger.debug(f"Loaded {cnt} weights for {self.prefix} MoE layer.")
+        logger.info(f"Loaded {cnt} weights for {self.prefix} MoE layer.")
 
         loaded_names = set()
         is_fused_backend = self.moe_backend in MoEBackend.fused_moe_backends()
