@@ -534,7 +534,12 @@ class MLAEinsum(JaxEinsum):
                 ).T
             else:
                 import numpy as np
-                dequantized_weight = jnp.array(np.asarray(self.weight.value).T)
+                weight_np = np.asarray(self.weight.value)
+                expected_shape = (A, N * (qk_nope_head_dim + v_head_dim))
+                if weight_np.shape == expected_shape:
+                    dequantized_weight = jnp.array(weight_np)
+                else:
+                    dequantized_weight = jnp.array(weight_np.T)
             if dequantized_weight.shape != (A, N *
                                             (qk_nope_head_dim + v_head_dim)):
                 raise ValueError(
