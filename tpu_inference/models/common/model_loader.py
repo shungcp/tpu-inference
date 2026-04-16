@@ -603,7 +603,7 @@ def get_model(
     mesh: Mesh,
     is_draft_model: bool = False,
 ) -> Any:
-    impl = envs.MODEL_IMPL_TYPE
+    impl = "flax_nnx"
     logger.info(f"Loading model with MODEL_IMPL_TYPE={impl}")
     if impl == "auto":
         impl = resolve_model_architecture(vllm_config)
