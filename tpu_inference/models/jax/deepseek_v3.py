@@ -533,13 +533,11 @@ class MLAEinsum(JaxEinsum):
                     block_size=None,
                 ).T
             else:
-                import numpy as np
-                weight_np = np.asarray(self.weight.value)
+                # BF16: use JAX array directly (np.asarray fails in multi-host)
+                dequantized_weight = self.weight.value
                 expected_shape = (A, N * (qk_nope_head_dim + v_head_dim))
-                if weight_np.shape == expected_shape:
-                    dequantized_weight = jnp.array(weight_np)
-                else:
-                    dequantized_weight = jnp.array(weight_np.T)
+                if dequantized_weight.shape != expected_shape:
+                    dequantized_weight = jnp.matrix_transpose(dequantized_weight)
             if dequantized_weight.shape != (A, N *
                                             (qk_nope_head_dim + v_head_dim)):
                 raise ValueError(
