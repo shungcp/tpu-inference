@@ -31,7 +31,7 @@ from tpu_inference.layers.jax.quantization import QuantizeMethodBase
 from tpu_inference.layers.jax.quantization.configs import QuantizationConfig
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.utils.weight_utils import (
-    assign_and_shard_param, jax_array_from_reshaped_torch)
+    assign_and_shard_param, jax_array_from_reshaped_torch, shard_put)
 
 modeling_flax_utils = FlaxUtils()
 logger = init_logger(__name__)
