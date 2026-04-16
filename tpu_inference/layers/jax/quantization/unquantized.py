@@ -117,6 +117,13 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
                     any(w is None for w in param._weights_to_load) for param in
                 [layer.kernel_gating_EDF, layer.kernel_up_proj_EDF]):
                 return False
+            # Guard: down_proj is assigned by _load_weights via
+            # assign_and_shard_param. When expert weights are spread across
+            # multiple safetensor files, gate/up _weights_to_load may be fully
+            # populated before down_proj is concatenated and assigned.
+            if isinstance(layer.kernel_down_proj_EFD.value,
+                          jax.ShapeDtypeStruct):
+                return False
 
             # Each entry in _weights_to_load is (1, F, D); concat gives (E, F, D).
             # Concatenation and transpose on CPU to avoid OOM; shard_put must be
