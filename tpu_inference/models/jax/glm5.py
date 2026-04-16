@@ -160,7 +160,7 @@ class Glm5Indexer(JaxModule):
             index_n_heads,
             use_bias=False,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(init_fn, (None, "model")),
+            kernel_init=nnx.with_partitioning(init_fn, ("model", None)),
             rngs=rng,
             quant_config=None,
             prefix=prefix + ".weights_proj",
