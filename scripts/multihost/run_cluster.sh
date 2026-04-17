@@ -109,10 +109,15 @@ fi
 # --shm-size=16G: Increases shared memory
 # -v HF_HOME: Mounts HuggingFace cache to avoid re-downloading models
 
-# Force cleanup of the image to ensure we pull the absolute latest
-echo "Ensuring we have the latest image for ${DOCKER_IMAGE}..."
-docker rmi "${DOCKER_IMAGE}" > /dev/null 2>&1 || true
-docker pull "${DOCKER_IMAGE}"
+# Pull the image only if it is not already available locally.
+# Skipping rmi+pull avoids destroying locally-built images that are
+# not hosted in a registry.
+if ! docker image inspect "${DOCKER_IMAGE}" > /dev/null 2>&1; then
+    echo "Image ${DOCKER_IMAGE} not found locally, pulling..."
+    docker pull "${DOCKER_IMAGE}"
+else
+    echo "Using local image ${DOCKER_IMAGE}"
+fi
  
 
 # Default to no gcloud mount
