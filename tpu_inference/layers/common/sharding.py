@@ -193,6 +193,7 @@ class ShardingConfigManager:
             attn_dp = max(
                 int(tensor_parallelism // num_kv_heads_per_device_in_kv_cache),
                 1)
+            attn_dp = min(attn_dp, num_kv_heads)  # cap: dp 不超过 KV head 数, for Qwen3MoE attn_dp<=4
             tensor_parallelism = tensor_parallelism // attn_dp
             attn_dp_expert = expert_parallelism
             expert_parallelism = 1
