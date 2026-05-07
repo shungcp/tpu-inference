@@ -23,5 +23,5 @@ try:
     if not hasattr(vllm, "SamplingStatus"):
         from vllm.sampling_params import RequestOutputKind
         vllm.RequestOutputKind = RequestOutputKind
-except ImportError:
+except Exception:
     pass
