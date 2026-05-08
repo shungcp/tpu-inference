@@ -1,18 +1,19 @@
-tpu-info
+tpu-info==0.11.0
 yapf==0.43.0
 pytest
 pytest-mock
 absl-py
 numpy
 google-cloud-storage
-jax
-jaxlib
+jax[tpu]==0.10.0
 --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html
 jaxtyping
-flax
-torchax
+flax==0.12.7
+torchax==0.0.12
 qwix==0.1.2
-torchvision
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.11.0+cpu
+torchvision==0.26.0+cpu
 pathwaysutils
 parameterized
 numba==0.62.1
