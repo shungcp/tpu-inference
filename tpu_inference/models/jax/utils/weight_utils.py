@@ -32,7 +32,8 @@ import torchax
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
-from jax.sharding import SingleDeviceSharding, get_mesh
+from jax._src import mesh as meshlib
+from jax.sharding import SingleDeviceSharding
 from safetensors import safe_open
 from vllm.config import ModelConfig, VllmConfig
 from vllm.model_executor.model_loader import register_model_loader
@@ -230,7 +231,7 @@ def shard_put(x: jax.Array,
     # Single device sharding requires this special handling
     # to avoid the recursive jit error.
     if mesh is None:
-        mesh = get_mesh()
+        mesh = meshlib.get_concrete_mesh()
 
     x_mesh = None
     if isinstance(x.sharding, NamedSharding):
@@ -926,7 +927,7 @@ class JaxDummyModelLoader(DummyModelLoader):
     def load_weights(self, model: JaxModule,
                      model_config: ModelConfig) -> None:
         weight_loading_start_counter = time.perf_counter()
-        mesh = jax.sharding.get_mesh()
+        mesh = meshlib.get_concrete_mesh()
 
         def _load_dummy_weight_on_thread(param_name, param):
             with cpu_mesh_context():

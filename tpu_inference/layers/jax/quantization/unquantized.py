@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 from typing import Optional
 
 import jax
@@ -113,18 +114,20 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase):
                     any(w is None for w in param._weights_to_load) for param in
                 [layer.kernel_gating_EDF, layer.kernel_up_proj_EDF]):
                 return False
-            w_gate = layer.kernel_gating_EDF.value
-            w_up = layer.kernel_up_proj_EDF.value
-
-            # Fuse the weights into w13: [Gate, Up]
-            w13_val = jnp.concatenate([w_gate, w_up], axis=1)
-
-            # TODO (jacobplatin): we probably want to make the sharding configurable
-            layer.kernel_gating_upproj_EDF = nnx.Param(
-                shard_put(w13_val, shardings=layer.edf_sharding))
+            w_gate = layer.kernel_gating_EDF.get_value()
+            w_up = layer.kernel_up_proj_EDF.get_value()
 
             del layer.kernel_gating_EDF
             del layer.kernel_up_proj_EDF
+
+            w13_val = jnp.concatenate([w_gate, w_up], axis=1)
+            del w_gate, w_up
+
+            layer.kernel_gating_upproj_EDF = nnx.Param(
+                shard_put(w13_val, shardings=layer.edf_sharding))
+            del w13_val
+
+            gc.collect()
 
         return True
 
