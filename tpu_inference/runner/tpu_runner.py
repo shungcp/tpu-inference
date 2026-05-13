@@ -841,6 +841,34 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     scheduler_output) as kv_connector_output:
                 # NOTE(Wenlong): It takes both `input_ids` and `inputs_embeds`,
                 # but one of them would be `None`
+                import time as _time, socket as _socket
+                _dbg_host = _socket.gethostname()
+                _dbg_ts = _time.strftime("%H:%M:%S")
+                if not hasattr(self, '_weight_checked'):
+                    self._weight_checked = True
+                    try:
+                        import jax as _jax
+                        _mesh_info = f"mesh_shape={dict(zip(self.mesh.axis_names, self.mesh.devices.shape))}, local_devs={[str(d) for d in _jax.local_devices()]}"
+                        _first_param = next(iter(self.state.values()))
+                        _shard_info = [(f"s{i}:dev={s.device},shape={s.data.shape}") for i, s in enumerate(_first_param.addressable_shards)]
+                        with open("/tmp/nan_debug.log", "a") as _f:
+                            _f.write(f"{_dbg_ts} {_dbg_host} MESH: {_mesh_info}\n")
+                            _f.write(f"{_dbg_ts} {_dbg_host} FIRST_PARAM_SHARDS: {_shard_info}\n")
+                            _f.flush()
+                    except Exception as e:
+                        with open("/tmp/nan_debug.log", "a") as _f:
+                            _f.write(f"{_dbg_ts} {_dbg_host} mesh check failed: {e}\n"); _f.flush()
+                try:
+                    for name, arr in [("input_ids", input_ids), ("input_positions", input_positions)]:
+                        if arr is not None:
+                            s = arr.addressable_shards[0].data
+                            s_np = np.asarray(s)
+                            with open("/tmp/nan_debug.log", "a") as _f:
+                                _f.write(f"{_dbg_ts} {_dbg_host} INPUT {name}: shape={s_np.shape}, min={np.min(s_np)}, max={np.max(s_np)}\n")
+                                _f.flush()
+                except Exception as e:
+                    with open("/tmp/nan_debug.log", "a") as _f:
+                        _f.write(f"{_dbg_ts} {_dbg_host} input check failed: {e}\n"); _f.flush()
                 (self.kv_caches, hidden_states,
                  aux_hidden_states) = self.model_fn(
                      self.state,
@@ -855,6 +883,19 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                      self.is_first_rank,
                      self.is_last_rank,
                  )
+                try:
+                    _nan_shards = []
+                    for _si, _sh in enumerate(hidden_states.addressable_shards):
+                        _sd = np.asarray(_sh.data)
+                        if np.any(np.isnan(_sd)):
+                            _nan_shards.append(f"s{_si}(dev={_sh.device})")
+                    _s0 = np.asarray(hidden_states.addressable_shards[0].data)
+                    with open("/tmp/nan_debug.log", "a") as _f:
+                        _f.write(f"{_dbg_ts} {_dbg_host} MODEL_OUT: nan_shards={_nan_shards}, total_shards={len(hidden_states.addressable_shards)}, shape={_s0.shape}, min={np.min(_s0)}, max={np.max(_s0)}\n")
+                        _f.flush()
+                except Exception as e:
+                    with open("/tmp/nan_debug.log", "a") as _f:
+                        _f.write(f"{_dbg_ts} {_dbg_host} model output check failed: {e}\n"); _f.flush()
             if not self.is_last_rank:
                 assert isinstance(hidden_states, JaxIntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
@@ -882,11 +923,28 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
             hidden_states = self._select_from_array_fn(hidden_states,
                                                        logits_indices)
+            _dbg_ts2 = _time.strftime("%H:%M:%S")
+            try:
+                hs_np = np.asarray(hidden_states.addressable_shards[0].data)
+                with open("/tmp/nan_debug.log", "a") as _f:
+                    _f.write(f"{_dbg_ts2} {_dbg_host} SELECTED_HIDDEN: NaN={np.any(np.isnan(hs_np))}, shape={hs_np.shape}, min={np.min(hs_np)}, max={np.max(hs_np)}\n")
+                    _f.flush()
+            except Exception as e:
+                with open("/tmp/nan_debug.log", "a") as _f:
+                    _f.write(f"{_dbg_ts2} {_dbg_host} selected hidden check failed: {e}\n"); _f.flush()
             logits = self.compute_logits_fn(
                 self.state,
                 hidden_states,
                 lora_metadata,
             )
+            try:
+                lg_np = np.asarray(logits.addressable_shards[0].data)
+                with open("/tmp/nan_debug.log", "a") as _f:
+                    _f.write(f"{_dbg_ts2} {_dbg_host} LOGITS: NaN={np.any(np.isnan(lg_np))}, shape={lg_np.shape}, min={np.min(lg_np)}, max={np.max(lg_np)}\n")
+                    _f.flush()
+            except Exception as e:
+                with open("/tmp/nan_debug.log", "a") as _f:
+                    _f.write(f"{_dbg_ts2} {_dbg_host} logits check failed: {e}\n"); _f.flush()
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
