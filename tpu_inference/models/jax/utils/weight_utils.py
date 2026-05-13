@@ -252,6 +252,8 @@ def shard_put(x: jax.Array,
                                   NamedSharding(mesh, shardings),
                                   source_mesh=x_mesh)
     else:
+        if isinstance(shardings, NamedSharding):
+            shardings = NamedSharding(mesh, shardings.spec)
         return general_device_put(x, shardings, source_mesh=x_mesh)
 
 
