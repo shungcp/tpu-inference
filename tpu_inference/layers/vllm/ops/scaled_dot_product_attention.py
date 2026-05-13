@@ -30,13 +30,16 @@ def scaled_dot_product_attention(
     scale=None,
     enable_gqa=False,
     *,
-    mesh: jax.sharding.Mesh,
+    mesh: jax.sharding.Mesh = None,
 ):
     """The same args as torch.nn.functional.scaled_dot_product_attention to use flash attention."""
     if dropout_p != 0.0:
         raise NotImplementedError("patched_sdpa does not support dropout_p")
     if enable_gqa is not False:
         raise NotImplementedError("patched_sdpa does not support enable_gqa")
+
+    if mesh is None:
+        mesh = jax.sharding.get_abstract_mesh()
 
     # Q, K, V shapes: (batch, num_heads, seq_len, head_dim)
     batch = query.shape[0]
