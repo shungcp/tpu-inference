@@ -26,6 +26,29 @@ from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.utils import get_mesh_shape_product
 
 
+def all_gather_topk_indices_and_weights(
+        topk_indices: jax.Array, topk_weights: jax.Array, dtype: jnp.dtype,
+        mesh: Mesh) -> tuple[jax.Array, jax.Array]:
+    top_k = topk_indices.shape[-1]
+    topk_indices = topk_indices.astype(jnp.int32).reshape(-1)
+    topk_weights = topk_weights.astype(jnp.float32).reshape(-1)
+    topk_weights = jax.lax.bitcast_convert_type(topk_weights,
+                                                topk_indices.dtype)
+
+    blob = jnp.stack([topk_indices, topk_weights])
+    blob = jax.lax.optimization_barrier(blob)
+    gathered_blob = jax.lax.with_sharding_constraint(
+        blob, NamedSharding(mesh, P(None, ShardingAxisName.MLP_DATA)))
+
+    topk_indices = gathered_blob[0]
+    topk_weights = gathered_blob[1]
+    topk_indices = topk_indices.reshape(-1, top_k)
+    topk_weights = jax.lax.bitcast_convert_type(topk_weights, jnp.float32)
+    topk_weights = topk_weights.reshape(-1, top_k).astype(dtype)
+
+    return topk_indices, topk_weights
+
+
 def apply_scoring_fn(scoring_fn: str, x: jax.Array) -> jax.Array:
     match scoring_fn:
         case "softmax":
@@ -386,8 +409,11 @@ def fused_moe_func(
     topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+    # All-gather topk_indices and topk_weights if attention dp is used.
+    if get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1:
+        topk_indices, topk_weights = all_gather_topk_indices_and_weights(
+            topk_indices, topk_weights, dtype, mesh)
     topk_weights = topk_weights.astype(dtype)
-    # All-gather topk weights for attention dp
     topk_weights = jax.lax.with_sharding_constraint(
         topk_weights, NamedSharding(mesh, P(ShardingAxisName.MLP_DATA, None)))
 
