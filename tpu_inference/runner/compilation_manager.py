@@ -539,8 +539,7 @@ class CompilationManager:
             # time re-compilation.
             logits_sharding = NamedSharding(
                 self.runner.mesh,
-                PartitionSpec(ShardingAxisName.MLP_DATA,
-                              ShardingAxisName.MLP_TENSOR))
+                PartitionSpec(ShardingAxisName.ATTN_DATA, None))
             # Similarly, `sampling_metadata_sharding` need to consistent
             # with runtime sampling_metadata sharding to the sample
             # function.
@@ -625,8 +624,7 @@ class CompilationManager:
         for num_reqs in self.runner.num_reqs_paddings:
             logits_sharding = NamedSharding(
                 self.runner.mesh,
-                PartitionSpec(ShardingAxisName.MLP_DATA,
-                              ShardingAxisName.MLP_TENSOR))
+                PartitionSpec(ShardingAxisName.ATTN_DATA, None))
             token_ids_sharding = NamedSharding(self.runner.mesh,
                                                PartitionSpec())
             logits = self._create_dummy_tensor((num_reqs, hsize), jnp.float32,

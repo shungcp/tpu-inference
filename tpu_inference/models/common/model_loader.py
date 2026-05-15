@@ -312,7 +312,7 @@ def get_flax_model(
 
     logits_sharding = NamedSharding(
         mesh,
-        PartitionSpec(ShardingAxisName.MLP_DATA, ShardingAxisName.MLP_TENSOR))
+        PartitionSpec(ShardingAxisName.ATTN_DATA, None))
 
     @jax.jit(out_shardings=(logits_sharding))
     def run_compute_logits(graphdef, state, *args):

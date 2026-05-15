@@ -399,8 +399,7 @@ class VllmModelWrapper:
         # output logits.
         @jax.jit(out_shardings=(NamedSharding(
             self.mesh,
-            PartitionSpec(ShardingAxisName.MLP_DATA,
-                          ShardingAxisName.MLP_TENSOR))))
+            PartitionSpec(ShardingAxisName.ATTN_DATA, None))))
         def compute_logits_func(
             params_and_buffers: Any,
             hidden_states: jax.Array,
