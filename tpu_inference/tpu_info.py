@@ -86,7 +86,7 @@ def get_num_chips() -> int:
         numeric_entries = [
             int(entry) for entry in vfio_entries if entry.isdigit()
         ]
-        return len(numeric_entries)
+        return len(numeric_entries) // get_num_cores_per_chip()
     except FileNotFoundError as e:
         logger.error("Failed to detect number of TPUs: %s", e)
         return 0
