@@ -22,11 +22,34 @@ import functools
 from enum import Enum
 from typing import Any
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
+from jax.experimental.layout import Layout, with_layout_constraint
 from jax.experimental.pallas import tpu as pltpu
+
+# How prepare_inputs hands q to the kernel; see the comment there. The modes are
+# cumulative, not alternatives: pin does everything swap4d does and adds to it.
+#   legacy           -- pre-2026-08 behaviour, for reproducing the A/B
+#   swap4d (default) -- swap tokens/kv-heads on the 4D view; faster for every
+#                       dtype, operand handed to the kernel is unchanged
+#   pin              -- swap4d PLUS a producer layout constraint; a further big
+#                       win when quantized, a small loss when not
+#
+# Validated on import rather than left to fall through. The branch below is
+# `if legacy / else`, so any unrecognised value -- a typo, or the old `pin4d`
+# and `fast` names -- would silently run swap4d and quietly produce an A/B that
+# measures the same thing twice. Three of the earlier layout experiments looked
+# like they worked when they were no-ops; do not add a fourth way to be fooled.
+RPA_Q_SWAP_MODES = ("legacy", "swap4d", "pin")
+RPA_Q_SWAP = os.environ.get("RPA_Q_SWAP", "swap4d")
+if RPA_Q_SWAP not in RPA_Q_SWAP_MODES:
+    raise ValueError(
+        f"RPA_Q_SWAP={RPA_Q_SWAP!r} is not one of {RPA_Q_SWAP_MODES}. "
+        "(`pin4d` and `fast` were renamed to `pin` and `swap4d` on 2026-08-12.)")
 
 from tpu_inference.kernels.ragged_paged_attention.v3.util import (
     align_to, cdiv, get_dtype_packing, get_tpu_version, next_power_of_2)
@@ -1171,30 +1194,73 @@ def prepare_inputs(
     num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head,
                                        q_packing)
     head_dim = align_to(actual_head_dim, 128)
-    q = (
-        jnp.pad(
-            q.reshape(
-                max_num_tokens,
-                actual_num_kv_heads,
-                actual_num_q_heads_per_kv_head,
-                actual_head_dim,
-            ),
-            (
-                (0, 0),
-                (0, 0),
-                (0, num_q_heads_per_kv_head - actual_num_q_heads_per_kv_head),
-                (0, head_dim - actual_head_dim),
-            ),
-            constant_values=0,
-        ).reshape(
+    q = jnp.pad(
+        q.reshape(
+            max_num_tokens,
+            actual_num_kv_heads,
+            actual_num_q_heads_per_kv_head,
+            actual_head_dim,
+        ),
+        (
+            (0, 0),
+            (0, 0),
+            (0, num_q_heads_per_kv_head - actual_num_q_heads_per_kv_head),
+            (0, head_dim - actual_head_dim),
+        ),
+        constant_values=0,
+    )
+    if RPA_Q_SWAP == "legacy":
+        # Pre-2026-08 behaviour, kept only so the A/B stays reproducible.
+        # TODO(jevinjiang): Explore fusing swapping non-tiling axis to DMA.
+        q = q.reshape(
             max_num_tokens,
             actual_num_kv_heads,
             num_q_heads_per_kv_head // q_packing,
             q_packing,
             head_dim,
+        ).swapaxes(0, 1)
+    else:
+        # Two things have to line up for the token/kv-head swap to cost one
+        # straight HBM-to-HBM copy instead of a VMEM round trip.
+        #
+        # 1. Swap while q is still 4D, and split the q-head axis into
+        #    (heads // packing, packing) only afterwards. Splitting first leaves
+        #    the two minor dims at (q_packing, head_dim) = (2, 128), and XLA
+        #    cannot reach that layout from a transpose directly -- it stages
+        #    through VMEM: copy in, bitcast, copy back out. On the 4D view the
+        #    minor dims stay (num_q_heads_per_kv_head, head_dim), which it does
+        #    reach in one copy, and the trailing reshape is then a pure bitcast
+        #    onto exactly the operand the kernel already asks for,
+        #    bf16[K,T,G/p,p,H]{4,3,2,1,0:T(2,128)(2,1)}. Nothing downstream moves.
+        #
+        # 2. Optionally pin the producer's output order (RPA_Q_SWAP=pin). Under a
+        #    quantized model the fused rope+activation-quant is laid out
+        #    [K][G][T][H], so even the 4D copy has to interleave G through T;
+        #    asking for plain [T][K][G][H] leaves it a contiguous move. This is
+        #    off by default because it is not a free win for everyone: XLA had
+        #    already found a good global layout for the unquantized graph, and
+        #    overriding it there just moves copies elsewhere.
+        #
+        # v6e-1, Qwen3-4B, 2048-token prefill, total device self time:
+        #                     legacy      4D swap    4D swap + pin
+        #   Qwix int8        30,202 us   28,929 us      27,362 us
+        #   bf16             36,406 us   36,116 us      36,565 us
+        #
+        # At the default the attention-path layout ops drop from 5.91 ms to
+        # 4.03 ms per int8 step, and to 1.65 ms with the pin -- past bf16's
+        # 2.08 ms. Both int8 frontends (Qwix online, offline compressed-tensors)
+        # showed the same 130.8 us/layer before the change. Generations are
+        # token-for-token unchanged. See qwen/bench_q_layouts.py for the ranking
+        # of candidate operand shapes and qwen/check_q_swap.py for the A/B.
+        if RPA_Q_SWAP == "pin":
+            q = with_layout_constraint(q, Layout(major_to_minor=(0, 1, 2, 3)))
+        q = q.swapaxes(0, 1).reshape(
+            actual_num_kv_heads,
+            max_num_tokens,
+            num_q_heads_per_kv_head // q_packing,
+            q_packing,
+            head_dim,
         )
-        # TODO(jevinjiang): Explore fusing swapping non-tiling axis to DMA.
-        .swapaxes(0, 1))
     # TODO(kyuyeunk, chengjiyao): Add kv quantization here.
     kv = merge_kv(k, v)
     return q, kv
