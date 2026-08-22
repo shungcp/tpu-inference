@@ -2027,7 +2027,15 @@ def prepare_q_inputs(
         q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
 ):
     _, actual_num_q_heads, actual_head_dim = q.shape
-    num_q_heads = align_to(actual_num_q_heads, get_dtype_packing(q.dtype))
+    # The packed head axis (num_q_heads // packing) is reshaped inside the
+    # kernel body (see load_bq/load_batch_bq) and must be a multiple of 4
+    # (the sublane tile) for that reshape to be a valid no-op retile. Padding
+    # only to the packing factor (e.g. 2 for bf16) is insufficient when
+    # actual_num_q_heads // packing isn't already a multiple of 4 (e.g. 20
+    # query heads at bf16 -> 10, not a multiple of 4) -- Mosaic then rejects
+    # the reshape with "Expected the 2nd minor dimension is aligned to the
+    # tile". Align to packing * 4 instead.
+    num_q_heads = align_to(actual_num_q_heads, get_dtype_packing(q.dtype) * 4)
     head_dim = align_to(actual_head_dim, 128)
     q = jnp.pad(
         q,
@@ -2053,7 +2061,8 @@ def prepare_q_nope_inputs(
   Returns: [max_num_tokens, num_q_heads, head_dim]
   """
     actual_num_q_heads, actual_max_num_tokens, actual_head_dim = q.shape
-    num_q_heads = align_to(actual_num_q_heads, get_dtype_packing(q.dtype))
+    # See prepare_q_inputs: the packed head axis must be a multiple of 4.
+    num_q_heads = align_to(actual_num_q_heads, get_dtype_packing(q.dtype) * 4)
     head_dim = align_to(actual_head_dim, 128)
 
     # Align T to sublane_multiple (i.e. dtype_packing * 8).
@@ -2075,7 +2084,8 @@ def prepare_q_nope_inputs(
                            transpose_axes=(1, 0, 2),
                            n_tile=128,
                            m_tile=32,
-                           vmem_limit_bytes=vmem_limit_bytes)[0]
+                           vmem_limit_bytes=vmem_limit_bytes,
+                           allow_full_dim_tile=True)[0]
     except ValueError as e:
         logger.warning(
             f"xpose_pipeline failed for shape={q.shape} dtype={q.dtype} "
@@ -2131,7 +2141,8 @@ def prepare_outputs(
                              transpose_axes=(1, 0, 2),
                              n_tile=_XPOSE_N_TILE_SIZE,
                              m_tile=64,
-                             vmem_limit_bytes=vmem_limit_bytes)[0]
+                             vmem_limit_bytes=vmem_limit_bytes,
+                             allow_full_dim_tile=True)[0]
     except ValueError as e:
         sublane_multiple = get_dtype_packing(out.dtype) * 8
         logger.warning(
