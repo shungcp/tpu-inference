@@ -135,9 +135,58 @@ def pin_vmem_custom_call(input_tensor: jax.Array, num_scalars: int = 0):
     ))(input_tensor)
 
 
+# Shapes (padded axis size, dtype) verified via real-workload profiling to
+# net-benefit from forcing xpose_pipeline through a single, untiled block
+# when no sub-dividing tile satisfies Mosaic's sublane-alignment
+# requirement, instead of the caller falling back to plain jnp.transpose.
+# This is opt-in and narrowly keyed on purpose: prev_closest_valid_divisor's
+# choice of tile depends only on (axis size, dtype), but whether skipping
+# the pipeline is actually *faster* is workload-dependent -- it was a small
+# net regression for one tested workload (int8 W8A8 prefill on the same
+# axis size) despite being a clear win for others, so this must stay an
+# explicit allowlist rather than a blanket behavior change. Do not add an
+# entry without a real before/after profile showing net benefit for that
+# (axis size, dtype); see notes/mla_layout_profiling/ in the originating PR
+# for methodology. Entries not in this set get the original, always-correct
+# jnp.transpose fallback -- i.e. zero behavior change for any shape/model
+# not explicitly verified here.
+_VERIFIED_SINGLE_TILE_SHAPES: frozenset[tuple[int, jnp.dtype]] = frozenset({
+    (24, jnp.dtype(jnp.bfloat16)),  # GLM-4.7-Flash, 20 heads padded to 24.
+})
+
+
+def prefers_single_tile_fallback(number: int, dtype) -> bool:
+  """Whether `number` @ `dtype` is a verified-safe single-tile fallback.
+
+  See `_VERIFIED_SINGLE_TILE_SHAPES` for what "verified" means and why this
+  must be an explicit allowlist, not inferred from `number`/`dtype` alone.
+  """
+  return (number, jnp.dtype(dtype)) in _VERIFIED_SINGLE_TILE_SHAPES
+
+
+def _resolve_tile(number: int, divider: int, multiple_of: int,
+                  allow_full_dim_tile: bool) -> int:
+  """`prev_closest_valid_divisor`, with an opt-in single-tile fallback.
+
+  `prev_closest_valid_divisor` itself is left untouched (still raises
+  `ValueError` when no sub-dividing tile exists) so every other caller of
+  that generic utility keeps its exact original behavior. Only when
+  `allow_full_dim_tile` is explicitly requested (see
+  `_VERIFIED_SINGLE_TILE_SHAPES`) do we catch that and use the full axis as
+  one untiled block -- Pallas accepts a sublane tile equal to the full array
+  dimension, so this is always correct, just not always faster.
+  """
+  try:
+    return prev_closest_valid_divisor(number, divider, multiple_of)
+  except ValueError:
+    if allow_full_dim_tile and number <= divider:
+      return number
+    raise
+
+
 @jax.jit(static_argnames=[
     'transpose_axes', 'n_tile', 'm_tile', 'parallel_axis', 'pipeline_axis',
-    'vmem_limit_bytes'
+    'vmem_limit_bytes', 'allow_full_dim_tile'
 ])
 def xpose_pipeline(input: jax.Array,
                    *,
@@ -146,7 +195,8 @@ def xpose_pipeline(input: jax.Array,
                    m_tile: int = 128,
                    parallel_axis: int = 0,
                    pipeline_axis: int = 1,
-                   vmem_limit_bytes: int | None = None):
+                   vmem_limit_bytes: int | None = None,
+                   allow_full_dim_tile: bool = False):
     """
     Double buffer transpose custom call implementation.
     n_tile is used to tile the parallel dimension while m_tile is used to tile the pipeline dimension.
@@ -161,6 +211,11 @@ def xpose_pipeline(input: jax.Array,
         (None), the kernel is subject to XLA's global scoped-vmem limit
         (--xla_tpu_scoped_vmem_limit_kib, 32 MiB by default), which large
         tile shapes can exceed at compile time.
+      allow_full_dim_tile: if no sub-dividing tile satisfies the sublane
+        alignment requirement, use the full axis as one untiled block
+        instead of raising -- only takes effect for
+        (axis size, dtype) pairs in `_VERIFIED_SINGLE_TILE_SHAPES`; see
+        `prefers_single_tile_fallback`.
     """
 
     def xpose_kernel(input_ref, output_ref):
@@ -176,18 +231,24 @@ def xpose_pipeline(input: jax.Array,
     # get_dtype_packing(dtype) * 8. If no such tiling exists,
     # then throw a ValueError
     sublane_multiple = get_dtype_packing(input.dtype) * 8
-    n_tile_new = prev_closest_valid_divisor(input.shape[parallel_axis],
-                                            n_tile,
-                                            multiple_of=sublane_multiple)
+    allow_n = allow_full_dim_tile and prefers_single_tile_fallback(
+        input.shape[parallel_axis], input.dtype)
+    allow_m = allow_full_dim_tile and prefers_single_tile_fallback(
+        input.shape[pipeline_axis], input.dtype)
+    n_tile_new = _resolve_tile(input.shape[parallel_axis],
+                               n_tile,
+                               sublane_multiple,
+                               allow_full_dim_tile=allow_n)
     if input.shape[parallel_axis] % n_tile_new != 0:
         raise ValueError(
             f"No divisor of parallel axis size {input.shape[parallel_axis]} "
             f"is both <= {n_tile} and divisible by {sublane_multiple} "
             f"(dtype={input.dtype}). Consider increasing n_tile and/or padding your input to be "
             f"suble-aligned (i.e. a multiple of {sublane_multiple}).")
-    m_tile_new = prev_closest_valid_divisor(input.shape[pipeline_axis],
-                                            m_tile,
-                                            multiple_of=sublane_multiple)
+    m_tile_new = _resolve_tile(input.shape[pipeline_axis],
+                               m_tile,
+                               sublane_multiple,
+                               allow_full_dim_tile=allow_m)
     if input.shape[pipeline_axis] % m_tile_new != 0:
         raise ValueError(
             f"No divisor of pipeline axis size {input.shape[pipeline_axis]} "

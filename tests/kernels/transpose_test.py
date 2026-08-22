@@ -23,8 +23,9 @@ from jax import shard_map
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from tpu_inference.kernels.mla.v2.transpose import (prev_closest_valid_divisor,
-                                                    xpose_full, xpose_pipeline)
+from tpu_inference.kernels.mla.v2.transpose import (
+    prefers_single_tile_fallback, prev_closest_valid_divisor, xpose_full,
+    xpose_pipeline)
 
 
 def benchmark_op(name, op_func, input_data, number=10):
@@ -320,6 +321,57 @@ class TestPrevClosestDivisor(parameterized.TestCase):
             prev_closest_valid_divisor(number,
                                        divider,
                                        multiple_of=multiple_of)
+
+
+class XposePipelineAllowFullDimTileTest(parameterized.TestCase):
+    """`xpose_pipeline`'s opt-in single-untiled-block fallback.
+
+  `allow_full_dim_tile=True` only takes effect for (axis size, dtype) pairs
+  explicitly listed in `_VERIFIED_SINGLE_TILE_SHAPES` -- see that constant's
+  docstring for why this must stay an explicit allowlist rather than a
+  blanket change to `prev_closest_valid_divisor` (some verified shapes are a
+  net win, but the same fallback was a small net *regression* for at least
+  one other tested workload sharing the same axis size/dtype).
+  """
+
+    def test_default_still_raises_for_no_divisor_shape(self):
+        # (24, bfloat16) has no divisor of 24 that's a multiple of 16 --
+        # without opting in, behavior must be identical to upstream: raise.
+        x = jnp.zeros((24, 128, 512), dtype=jnp.bfloat16)
+        with self.assertRaises(ValueError):
+            xpose_pipeline(x, transpose_axes=(1, 0, 2), n_tile=128, m_tile=32)
+
+    def test_allowlisted_shape_succeeds_when_opted_in(self):
+        x = jnp.zeros((24, 128, 512), dtype=jnp.bfloat16)
+        out = xpose_pipeline(x,
+                             transpose_axes=(1, 0, 2),
+                             n_tile=128,
+                             m_tile=32,
+                             allow_full_dim_tile=True)[0]
+        self.assertEqual(out.shape, (128, 24, 512))
+
+    def test_non_allowlisted_shape_still_raises_even_when_opted_in(self):
+        # 40 has the same "no divisor is a multiple of 16" pattern as 24,
+        # but is not a verified/allowlisted shape -- opting in must not
+        # silently change behavior for shapes nobody has profiled.
+        x = jnp.zeros((40, 128, 512), dtype=jnp.bfloat16)
+        with self.assertRaises(ValueError):
+            xpose_pipeline(x,
+                           transpose_axes=(1, 0, 2),
+                           n_tile=128,
+                           m_tile=32,
+                           allow_full_dim_tile=True)
+
+    @parameterized.parameters(
+        dict(number=24, dtype=jnp.bfloat16, expected=True),
+        dict(number=128, dtype=jnp.bfloat16, expected=False),  # DeepSeek-V3
+        dict(number=64, dtype=jnp.bfloat16, expected=False),  # GLM-5
+        dict(number=40, dtype=jnp.bfloat16, expected=False),  # unverified
+        dict(number=24, dtype=jnp.float32, expected=False),  # wrong dtype
+    )
+    def test_prefers_single_tile_fallback(self, number, dtype, expected):
+        self.assertEqual(prefers_single_tile_fallback(number, dtype),
+                         expected)
 
 
 if __name__ == "__main__":
