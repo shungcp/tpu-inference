@@ -523,34 +523,57 @@ class MLAEinsum(JaxEinsum):
         if len(self.loaded) != len(named_params):
             return
         assert self.quant_config is not None
-        # After loading, split the weights into k/v
-        with cpu_mesh_context():
-            dequantized_weight = dequantize_tensor(
-                self.weight,
-                self.weight_scale_inv,
-                (0, 1),
-                block_size=None,
-            )
-            A, N, qk_nope_head_dim, v_head_dim = self.mla_layer.kv_lora_rank, self.mla_layer.N, self.mla_layer.qk_nope_head_dim, self.mla_layer.v_head_dim
-            if dequantized_weight.shape != (A, N *
-                                            (qk_nope_head_dim + v_head_dim)):
+        # Unquantized (e.g. plain bf16) checkpoints never get a
+        # `weight_scale_inv` param created for them (UnquantizedConfig's
+        # create_weights_jax only creates `weight`) -- only quantized
+        # checkpoints (fp8/int8 etc.) do. Skip the dequantize/requantize
+        # round-trip entirely for the unquantized case; there's nothing to
+        # dequantize and no scale to propagate to k_up_proj/v_up_proj.
+        is_quantized = hasattr(self, 'weight_scale_inv')
+        A, N, qk_nope_head_dim, v_head_dim = self.mla_layer.kv_lora_rank, self.mla_layer.N, self.mla_layer.qk_nope_head_dim, self.mla_layer.v_head_dim
+
+        def _check_shape(weight):
+            if weight.shape != (A, N * (qk_nope_head_dim + v_head_dim)):
                 raise ValueError(
-                    f"Unexpected weight shape after dequantization: {dequantized_weight.shape}, expected {(A, N * (qk_nope_head_dim + v_head_dim))=}"
+                    f"Unexpected weight shape after dequantization: {weight.shape}, expected {(A, N * (qk_nope_head_dim + v_head_dim))=}"
                 )
-            dequantized_weight = dequantized_weight.reshape(
+
+        if is_quantized:
+            # Quantized (fp8/int8) checkpoints are loaded onto CPU for the
+            # dequantize/requantize round-trip -- cpu_mesh_context() matches
+            # where `self.weight`/`self.weight_scale_inv` already live.
+            with cpu_mesh_context():
+                dequantized_weight = dequantize_tensor(
+                    self.weight,
+                    self.weight_scale_inv,
+                    (0, 1),
+                    block_size=None,
+                )
+                _check_shape(dequantized_weight)
+                dequantized_weight = dequantized_weight.reshape(
+                    A, N, qk_nope_head_dim + v_head_dim)
+                k_ANH, v_ANH = jnp.split(dequantized_weight,
+                                         [qk_nope_head_dim], axis=-1)
+                k_ANH_weight, k_ANH_scale = quantize_tensor(k_ANH,
+                                                            self.weight.dtype,
+                                                            dim=-1)
+                v_ANH_weight, v_1NH_scale = quantize_tensor(v_ANH,
+                                                            self.weight.dtype,
+                                                            dim=0)
+                # As of writing, sharded_quantized_batched_matmul expects scale to be
+                # a different shape order than weight
+                k_N1A_scale = k_ANH_scale.transpose(1, 2, 0)
+                v_N1H_scale = v_1NH_scale.transpose(1, 0, 2)
+        else:
+            # Unquantized (e.g. plain bf16) weights are already sharded
+            # across TPU devices by the standard weight loader -- operate on
+            # them directly under the current (TPU) mesh, not cpu_mesh_context.
+            _check_shape(self.weight)
+            dequantized_weight = self.weight.reshape(
                 A, N, qk_nope_head_dim + v_head_dim)
-            k_ANH, v_ANH = jnp.split(dequantized_weight, [qk_nope_head_dim],
-                                     axis=-1)
-            k_ANH_weight, k_ANH_scale = quantize_tensor(k_ANH,
-                                                        self.weight.dtype,
-                                                        dim=-1)
-            v_ANH_weight, v_1NH_scale = quantize_tensor(v_ANH,
-                                                        self.weight.dtype,
-                                                        dim=0)
-            # As of writing, sharded_quantized_batched_matmul expects scale to be
-            # a different shape order than weight
-            k_N1A_scale = k_ANH_scale.transpose(1, 2, 0)
-            v_N1H_scale = v_1NH_scale.transpose(1, 0, 2)
+            k_ANH_weight, v_ANH_weight = jnp.split(dequantized_weight,
+                                                   [qk_nope_head_dim],
+                                                   axis=-1)
         mla_layer = self.mla_layer
         setattr(
             mla_layer, "k_up_proj",
@@ -573,22 +596,24 @@ class MLAEinsum(JaxEinsum):
         # Cannot apply anh_sharding to scales, otherwise it complains about shape mismatch.
         mla_layer.k_up_proj.weight.value = shard_put(
             k_ANH_weight, self.mla_layer.anh_sharding)
-        mla_layer.k_up_proj.weight_scale_inv.value = shard_put(k_N1A_scale, ())
         mla_layer.v_up_proj.weight.value = shard_put(
             v_ANH_weight, self.mla_layer.anh_sharding)
-        mla_layer.v_up_proj.weight_scale_inv.value = shard_put(v_N1H_scale, ())
+        if is_quantized:
+            mla_layer.k_up_proj.weight_scale_inv.value = shard_put(
+                k_N1A_scale, ())
+            mla_layer.v_up_proj.weight_scale_inv.value = shard_put(
+                v_N1H_scale, ())
 
         delattr(self, 'weight')
-        delattr(self, 'weight_scale_inv')
+        if is_quantized:
+            delattr(self, 'weight_scale_inv')
         delattr(self, 'quant_method')
         # `mla_layer` was only needed to perform the k/v split above; keeping
         # it creates a permanent reference cycle (mla_layer.kv_b_proj.mla_layer
         # is mla_layer). nnx's own graph traversal is cycle-safe (see
         # `named_children` override above), but raw `jax.jit`/`jax.tree_util`
-        # pytree flattening (e.g. qwix's quantization path, or any other code
-        # that passes the model through a plain `jax.jit` instead of
-        # `nnx.jit`) is not, and recurses infinitely over this cycle until it
-        # hits `RecursionError`. Drop it now that it's unused.
+        # pytree flattening (e.g. qwix's quantization path) is not and
+        # recurses infinitely over this cycle. Drop it now that it's unused.
         delattr(self, 'mla_layer')
 
 
