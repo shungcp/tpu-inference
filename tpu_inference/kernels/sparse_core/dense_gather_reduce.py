@@ -274,6 +274,39 @@ def _jax_fallback(x,
     return out.astype(x.dtype)
 
 
+# `row_chunk_size` defaults to 512, but the Pallas kernel's actual hardware
+# tiling constraint (surfaced by Mosaic at compile time as "Slice sizes along
+# tiled dimensions must be aligned to tiles ... divisible by 256") is a
+# *256-row* tile on the output ref -- not the `num_lanes` (8) that
+# `_sc_gather_reduce`'s own internal ValueError message describes. That
+# comment is incomplete: `row_chunk_size` being a multiple of `num_lanes` is
+# necessary but not sufficient; 256 is empirically the true minimum for
+# GLM-4.7-Flash's (reduce_group_size=4, dtype=bf16) config (200/224/240/248
+# all fail to compile; 256 and 512 both compile and match the `_jax_fallback`
+# reference bit-for-bit). This has NOT been verified for other
+# (reduce_group_size, dtype) combinations, so -- same design as the MLA
+# `xpose_pipeline` allow-list fix -- this is an explicit, narrowly-keyed
+# allow-list rather than a change to the function's default. Any
+# (reduce_group_size, dtype) not in this set keeps the original
+# `row_chunk_size=512` behavior exactly.
+#
+# Effect for an allow-listed entry: `is_compatible`'s row-count requirement
+# (idx.size must be a multiple of row_chunk_size * num_cores * num_subcores)
+# drops from a multiple of 4096 tokens (512 * 2 * 16 / reduce_group_size) to
+# a multiple of 2048 tokens (256 * 2 * 16 / 4) for GLM-4.7-Flash's topk=4 --
+# doubling how often real serving batch sizes can use the SparseCore kernel
+# instead of the unaccelerated `_jax_fallback`.
+_VERIFIED_ROW_CHUNK_SIZES: dict[tuple[int, jnp.dtype], int] = {
+    (4, jnp.dtype(jnp.bfloat16)): 256,  # GLM-4.7-Flash: topk=4, bf16.
+}
+
+
+def _resolve_row_chunk_size(reduce_group_size: int, dtype) -> int:
+    """Returns the smallest verified-safe `row_chunk_size`, else the original 512 default."""
+    return _VERIFIED_ROW_CHUNK_SIZES.get((reduce_group_size, jnp.dtype(dtype)),
+                                         512)
+
+
 @jax.jit(static_argnames=("reduce_group_size", "topk_wgt_zero_nan"))
 def dense_gather_reduce(
     x: jax.Array,
@@ -295,7 +328,9 @@ def dense_gather_reduce(
     topk_wgt_zero_nan: If True, treat zero weights as indicators of NaN during
       multiplication, resulting in zero output.
   """
-    if is_compatible(x, indices, reduce_group_size):
+    row_chunk_size = _resolve_row_chunk_size(reduce_group_size, x.dtype)
+    if is_compatible(x, indices, reduce_group_size,
+                     row_chunk_size=row_chunk_size):
         K = x.shape[-1]
         # The kernel slices the operand along the hidden (column) dimension,
         # which carries a 128-wide lane tile in the HBM layout
@@ -320,6 +355,7 @@ def dense_gather_reduce(
                 topk_weights.reshape(-1),
                 reduce_group_size=reduce_group_size,
                 col_chunk_size=col_chunk_size,
+                row_chunk_size=row_chunk_size,
                 topk_wgt_zero_nan=topk_wgt_zero_nan,
             )
     # Fallback to JAX baseline
