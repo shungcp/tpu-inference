@@ -554,9 +554,15 @@ def apply_qwix_quantization(
         kv_cache_head_size=head_size,
         kv_cache_dtype=kv_cache_dtype)
 
-    def create_and_quantize_model_factory() -> Callable:
+    def create_and_quantize_model_factory(
+            **_unused_eval_shape_kwargs) -> Callable:
         """
         Helper function to create and quantize the abstract model.
+
+        Accepts and ignores arbitrary keyword arguments (e.g. `graph_updates`)
+        that `nnx.eval_shape` forwards to the wrapped function so this stays
+        compatible across flax versions that add new optional eval_shape
+        kwargs.
         """
         model = model_or_model_fn()
         return qwix_quantize_fn_for_eval(model=model, rng=rng)
