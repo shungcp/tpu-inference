@@ -77,6 +77,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
 
     from tpu_inference.models.jax.deepseek_v3 import DeepseekV3ForCausalLM
     from tpu_inference.models.jax.dflash import DFlashForCausalLM
+    from tpu_inference.models.jax.glm4_moe_lite import Glm4MoeLiteForCausalLM
     from tpu_inference.models.jax.gemma4 import Gemma4ForCausalLM
     from tpu_inference.models.jax.gemma4_mm import \
         Gemma4ForConditionalGeneration
@@ -92,6 +93,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     from tpu_inference.models.jax.qwen3 import Qwen3ForCausalLM
     _MODEL_REGISTRY["Llama4ForCausalLM"] = Llama4ForCausalLM
     _MODEL_REGISTRY["DeepseekV3ForCausalLM"] = DeepseekV3ForCausalLM
+    _MODEL_REGISTRY["Glm4MoeLiteForCausalLM"] = Glm4MoeLiteForCausalLM
     _MODEL_REGISTRY["LlamaForCausalLM"] = LlamaForCausalLM
     _MODEL_REGISTRY["Llama4ForConditionalGeneration"] = LlamaGuard4ForCausalLM
     _MODEL_REGISTRY["Qwen3ForCausalLM"] = Qwen3ForCausalLM
@@ -142,9 +144,14 @@ def _get_nnx_model(
     model_config = (vllm_config.speculative_config.draft_model_config
                     if is_draft_model else vllm_config.model_config)
 
-    def create_abstract_model() -> nnx.Module:
+    def create_abstract_model(**_unused_eval_shape_kwargs) -> nnx.Module:
         """
         Helper class to create an abstract model for `nnx.eval_shape`.
+
+        Accepts and ignores arbitrary keyword arguments (e.g. `graph_updates`)
+        that `nnx.eval_shape` forwards to the wrapped function so this stays
+        compatible across flax versions that add new optional eval_shape
+        kwargs.
 
         Returns:
             An abstract model function.
