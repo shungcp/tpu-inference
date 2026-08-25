@@ -1128,6 +1128,106 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
+
+    # GLM-4.7-Flash batched decode. (TPU v6e, w8a16/bf16 MLA)
+    # Tuned via mla_kernel_tuner.py (Bayesian search, local, run_id=004,
+    # notes/perf_loop/round6_mla_tuning/) across all 11 max_num_tokens
+    # buckets the kernel is invoked with. num_kv_pages_per_block=2 was the
+    # best or a statistical tie with the best (within ~1% of the fastest
+    # config found) at every bucket, consistently beating both
+    # num_kv_pages_per_block=1 (worse) and the untuned fallback default of 3
+    # (never sampled by the search space, which only covers powers of two).
+    **{
+        TuningKey(
+            case="batched_decode",
+            max_num_tokens=max_num_tokens,
+            actual_num_q_heads=20,
+            actual_lkv_dim=512,
+            actual_r_dim=64,
+            kv_dtype="bfloat16",
+            q_dtype="bfloat16",
+            page_size_per_kv_packing=32,
+            kv_packing=32,
+            max_num_seqs=256,
+            pages_per_seq=2,
+        ): TunableParams(
+            num_kv_pages_per_block=2,
+            num_queries_per_block=1,
+            vmem_limit_bytes=62914560,
+            decode_batch_size=4,
+        )
+        for max_num_tokens in
+        (4, 8, 16, 32, 64, 128, 160, 256, 512, 1024, 2048)
+    },
+
+    # GLM-4.7-Flash mixed (prefill). (TPU v6e, w8a16/bf16 MLA)
+    # Tuned via a direct micro-benchmark sweep of mla_ragged_paged_attention
+    # with prefill-shaped inputs (single sequence, q_len=max_num_tokens) --
+    # mla_kernel_tuner.py's generate_cases() hardcodes case="batched_decode"
+    # and always builds decode-shaped (q_len=1) inputs, so it has no path for
+    # this case at all (notes/perf_loop/round7_mla_mixed_tuning/tune_mixed.py).
+    # pages_per_seq=2 corresponds to a `--max-model-len 2048` server (e.g. the
+    # correctness-check scripts used in earlier rounds). Untuned fallback
+    # (get_tuned_params below) is num_kv_pages_per_block=1,
+    # num_queries_per_block=16 -- at the realistic prefill sizes this matters
+    # most for (max_num_tokens 128..2048), that fallback is 1.16x-2.13x
+    # slower than the tuned config below, which was within 0.4% of the
+    # fastest config found at every one of those 5 buckets (and within ~5%
+    # at the small, decode-adjacent buckets where latency is noise-dominated
+    # regardless of params).
+    **{
+        TuningKey(
+            case="mixed",
+            max_num_tokens=max_num_tokens,
+            actual_num_q_heads=20,
+            actual_lkv_dim=512,
+            actual_r_dim=64,
+            kv_dtype="bfloat16",
+            q_dtype="bfloat16",
+            page_size_per_kv_packing=32,
+            kv_packing=32,
+            max_num_seqs=256,
+            pages_per_seq=2,
+        ): TunableParams(
+            num_kv_pages_per_block=2,
+            num_queries_per_block=128,
+            vmem_limit_bytes=62914560,
+            q_split=8,
+        )
+        for max_num_tokens in
+        (4, 8, 16, 32, 64, 128, 160, 256, 512, 1024, 2048)
+    },
+
+    # GLM-4.7-Flash mixed (prefill), pages_per_seq=8. (TPU v6e, w8a16/bf16 MLA)
+    # IMPORTANT: pages_per_seq=8 (not 2) is what the actual
+    # `vllm serve --max-model-len 8192` production/e2e-bench config computes
+    # at runtime (confirmed from e2e_bench.log) -- num_kv_pages_per_block=1,
+    # num_queries_per_block=128, q_split=8 was never worse than the untuned
+    # fallback at any of the 11 buckets (within 1% at the tiny/noise-dominated
+    # ones) and was 1.16x/1.44x faster at the realistic 1024/2048-token
+    # buckets -- and within 2.5% of the true per-bucket best everywhere.
+    **{
+        TuningKey(
+            case="mixed",
+            max_num_tokens=max_num_tokens,
+            actual_num_q_heads=20,
+            actual_lkv_dim=512,
+            actual_r_dim=64,
+            kv_dtype="bfloat16",
+            q_dtype="bfloat16",
+            page_size_per_kv_packing=32,
+            kv_packing=32,
+            max_num_seqs=256,
+            pages_per_seq=8,
+        ): TunableParams(
+            num_kv_pages_per_block=1,
+            num_queries_per_block=128,
+            vmem_limit_bytes=62914560,
+            q_split=8,
+        )
+        for max_num_tokens in
+        (4, 8, 16, 32, 64, 128, 160, 256, 512, 1024, 2048)
+    },
 }
 
 
