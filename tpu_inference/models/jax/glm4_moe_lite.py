@@ -126,6 +126,8 @@ class Glm4MoeLiteAttention(JaxModule):
 
         self.rope_theta: float = _get_rope_theta(config)
         self.rope_scaling = None  # standard RoPE, no scaling
+        self.rope_input_ordering: str = ("interleaved" if getattr(
+            config, "rope_interleave", True) else "split")
 
         sharding_size = mesh.shape["model"]
         self.num_heads = utils.get_padded_num_heads(self.num_heads,
@@ -247,7 +249,8 @@ class Glm4MoeLiteAttention(JaxModule):
                                 md.input_positions,
                                 self.qk_rope_head_dim,
                                 self.rope_theta,
-                                self.rope_scaling)
+                                self.rope_scaling,
+                                rope_input_ordering=self.rope_input_ordering)
         # Project q_nope into latent space via absorbed k_up_proj.
         # k_up_proj's einsum is "TNH,ANH->NTA" -- output is head-major (N,T,A).
         q_NTA = self.k_up_proj(q_nope)
@@ -264,7 +267,8 @@ class Glm4MoeLiteAttention(JaxModule):
                                 md.input_positions,
                                 self.qk_rope_head_dim,
                                 self.rope_theta,
-                                self.rope_scaling)
+                                self.rope_scaling,
+                                rope_input_ordering=self.rope_input_ordering)
         k_rope_SH = k_rope_SNH[:, 0, :]
 
         # KV cache quantization (if configured)
